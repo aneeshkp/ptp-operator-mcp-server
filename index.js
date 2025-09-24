@@ -313,6 +313,80 @@ class PTPOperatorMCPServer {
               }
             }
           }
+        },
+        {
+          name: 'diagnose_ptp_issues',
+          description: 'AI-powered comprehensive PTP issue diagnosis with actionable recommendations',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              namespace: {
+                type: 'string',
+                description: 'PTP namespace (default: openshift-ptp)',
+                default: 'openshift-ptp'
+              },
+              includeMetrics: {
+                type: 'boolean',
+                description: 'Include detailed metrics analysis',
+                default: true
+              },
+              severity: {
+                type: 'string',
+                description: 'Focus on specific severity level',
+                enum: ['all', 'critical', 'warning', 'info'],
+                default: 'all'
+              },
+              sinceHours: {
+                type: 'number',
+                description: 'Analyze data from last N hours (default: 2)',
+                default: 2
+              },
+              includeLogs: {
+                type: 'boolean',
+                description: 'Include log analysis in diagnosis',
+                default: true
+              }
+            }
+          }
+        },
+        {
+          name: 'get_cloud_events',
+          description: 'Get and analyze recent cloud events from cloud-event-proxy logs',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              namespace: {
+                type: 'string',
+                description: 'PTP namespace (default: openshift-ptp)',
+                default: 'openshift-ptp'
+              },
+              podName: {
+                type: 'string',
+                description: 'Specific pod name (optional)'
+              },
+              count: {
+                type: 'number',
+                description: 'Number of recent events to retrieve (default: 10)',
+                default: 10
+              },
+              eventType: {
+                type: 'string',
+                description: 'Filter by event type (optional)',
+                enum: ['sync-state', 'lock-state', 'clock-class', 'all'],
+                default: 'all'
+              },
+              sinceMinutes: {
+                type: 'number',
+                description: 'Events from last N minutes (default: 30)',
+                default: 30
+              },
+              includeMetrics: {
+                type: 'boolean',
+                description: 'Include cloud-event-proxy metrics',
+                default: true
+              }
+            }
+          }
         }
       ]
     }));
@@ -344,6 +418,10 @@ class PTPOperatorMCPServer {
             return await this.monitorPTPEvents(args);
           case 'get_ptp_config':
             return await this.getPTPConfig(args);
+          case 'diagnose_ptp_issues':
+            return await this.diagnosePTPIssues(args);
+          case 'get_cloud_events':
+            return await this.getCloudEvents(args);
           default:
             throw new McpError(ErrorCode.MethodNotFound, `Tool ${name} not found`);
         }
@@ -860,288 +938,4 @@ class PTPOperatorMCPServer {
           },
         ],
       };
-    } catch (error) {
-      throw new McpError(ErrorCode.InternalError, `Failed to get PTP config: ${error.message}`);
     }
-  }
-
-  // Helper methods
-  async getFirstPTPPod(namespace) {
-    const response = await this.k8sApi.listNamespacedPod(
-      namespace, undefined, undefined, undefined, undefined, 'app=linuxptp-daemon'
-    );
-    
-    if (response.body.items.length === 0) {
-      throw new Error('No PTP pods found');
-    }
-    
-    return response.body.items[0].metadata.name;
-  }
-
-  async execCommandInPod(namespace, podName, containerName, command) {
-    return new Promise((resolve, reject) => {
-      let stdout = '';
-      let stderr = '';
-
-      this.exec.exec(
-        namespace,
-        podName,
-        containerName,
-        command,
-        stdout,
-        stderr,
-        null, // stdin
-        false, // tty
-        (status) => {
-          if (status.status === 'Success') {
-            resolve(stdout);
-          } else {
-            reject(new Error(`Command failed: ${stderr || status.message || 'Unknown error'}`));
-          }
-        }
-      );
-    });
-  }
-
-  analyzePTPLogContent(logs) {
-    const lines = logs.split('\n');
-    const analysis = {
-      faultyCount: 0,
-      slaveCount: 0,
-      masterCount: 0,
-      listeningCount: 0,
-      errors: [],
-      warnings: [],
-      stateChanges: []
-    };
-
-    lines.forEach(line => {
-      const lowerLine = line.toLowerCase();
-      
-      if (lowerLine.includes('faulty')) {
-        analysis.faultyCount++;
-      }
-      if (lowerLine.includes('slave')) {
-        analysis.slaveCount++;
-      }
-      if (lowerLine.includes('master')) {
-        analysis.masterCount++;
-      }
-      if (lowerLine.includes('listening')) {
-        analysis.listeningCount++;
-      }
-      if (lowerLine.includes('error')) {
-        analysis.errors.push(line.trim());
-      }
-      if (lowerLine.includes('warn')) {
-        analysis.warnings.push(line.trim());
-      }
-      if (lowerLine.includes('state') && (lowerLine.includes('change') || lowerLine.includes('transition'))) {
-        analysis.stateChanges.push(line.trim());
-      }
-    });
-
-    let summary = '=== AUTOMATIC PTP LOG ANALYSIS ===\n';
-    summary += `FAULTY states: ${analysis.faultyCount}\n`;
-    summary += `SLAVE states: ${analysis.slaveCount}\n`;
-    summary += `MASTER states: ${analysis.masterCount}\n`;
-    summary += `LISTENING states: ${analysis.listeningCount}\n`;
-    summary += `Errors found: ${analysis.errors.length}\n`;
-    summary += `Warnings found: ${analysis.warnings.length}\n`;
-    summary += `State changes: ${analysis.stateChanges.length}\n`;
-    
-    if (analysis.errors.length > 0) {
-      summary += '\nRecent errors:\n' + analysis.errors.slice(-3).join('\n') + '\n';
-    }
-    
-    if (analysis.stateChanges.length > 0) {
-      summary += '\nRecent state changes:\n' + analysis.stateChanges.slice(-3).join('\n') + '\n';
-    }
-    
-    summary += '=== END ANALYSIS ===\n\n';
-    
-    return summary;
-  }
-
-  performFaultAnalysis(logs) {
-    const lines = logs.split('\n');
-    const faultPatterns = {
-      faulty: /faulty/i,
-      timeout: /timeout/i,
-      unreachable: /unreachable/i,
-      offset_high: /offset.*[1-9]\d{6}/i, // Large offsets (>1M ns)
-      frequency_high: /frequency.*[1-9]\d{2}/i, // High frequency adjustments
-    };
-
-    const faultCounts = {};
-    const faultLines = {};
-    
-    Object.keys(faultPatterns).forEach(key => {
-      faultCounts[key] = 0;
-      faultLines[key] = [];
-    });
-
-    lines.forEach(line => {
-      Object.keys(faultPatterns).forEach(key => {
-        if (faultPatterns[key].test(line)) {
-          faultCounts[key]++;
-          if (faultLines[key].length < 5) { // Keep only first 5 examples
-            faultLines[key].push(line.trim());
-          }
-        }
-      });
-    });
-
-    let analysis = '=== DETAILED FAULT ANALYSIS ===\n';
-    
-    Object.keys(faultCounts).forEach(key => {
-      analysis += `${key.toUpperCase()}: ${faultCounts[key]} occurrences\n`;
-      if (faultLines[key].length > 0) {
-        analysis += `  Examples:\n  ${faultLines[key].join('\n  ')}\n\n`;
-      }
-    });
-
-    // Overall health assessment
-    const totalFaults = Object.values(faultCounts).reduce((a, b) => a + b, 0);
-    analysis += `OVERALL FAULT COUNT: ${totalFaults}\n`;
-    
-    if (totalFaults === 0) {
-      analysis += 'STATUS: HEALTHY - No faults detected\n';
-    } else if (totalFaults < 10) {
-      analysis += 'STATUS: MINOR ISSUES - Few faults detected\n';
-    } else if (totalFaults < 50) {
-      analysis += 'STATUS: MODERATE ISSUES - Several faults detected\n';
-    } else {
-      analysis += 'STATUS: CRITICAL ISSUES - Many faults detected\n';
-    }
-    
-    analysis += '=== END FAULT ANALYSIS ===\n';
-    
-    return analysis;
-  }
-
-  parsePrometheusMetrics(metricsText, filter) {
-    const lines = metricsText.split('\n');
-    const metrics = {};
-
-    lines.forEach(line => {
-      if (line.startsWith('#') || line.trim() === '') return;
-      
-      if (!filter || line.includes(filter)) {
-        const parts = line.split(' ');
-        if (parts.length >= 2) {
-          const metricName = parts[0];
-          const value = parts[1];
-          
-          // Parse metric labels if present
-          const labelMatch = metricName.match(/([^{]+)({.*})?/);
-          if (labelMatch) {
-            const baseName = labelMatch[1];
-            const labels = labelMatch[2] || '{}';
-            
-            if (!metrics[baseName]) {
-              metrics[baseName] = [];
-            }
-            
-            metrics[baseName].push({
-              labels: labels,
-              value: parseFloat(value) || value,
-              rawLine: line
-            });
-          }
-        }
-      }
-    });
-
-    return metrics;
-  }
-
-  summarizeMetrics(metrics) {
-    let summary = '=== METRICS SUMMARY ===\n';
-    
-    Object.keys(metrics).forEach(metricName => {
-      summary += `\n${metricName}:\n`;
-      metrics[metricName].forEach(metric => {
-        summary += `  ${metric.labels} = ${metric.value}\n`;
-      });
-    });
-
-    // Special handling for common PTP metrics
-    if (metrics['interface_role']) {
-      summary += '\n=== INTERFACE ROLES ===\n';
-      metrics['interface_role'].forEach(metric => {
-        const roleValue = metric.value === 1 ? 'ACTIVE' : 'INACTIVE';
-        summary += `  ${metric.labels} = ${roleValue}\n`;
-      });
-    }
-
-    if (metrics['clock_state']) {
-      summary += '\n=== CLOCK STATES ===\n';
-      metrics['clock_state'].forEach(metric => {
-        const stateNames = {
-          0: 'INITIALIZING',
-          1: 'FAULTY',
-          2: 'DISABLED',
-          3: 'LISTENING',
-          4: 'PRE_MASTER',
-          5: 'MASTER',
-          6: 'PASSIVE',
-          7: 'UNCALIBRATED',
-          8: 'SLAVE'
-        };
-        const stateName = stateNames[metric.value] || `UNKNOWN(${metric.value})`;
-        summary += `  ${metric.labels} = ${stateName}\n`;
-      });
-    }
-
-    if (metrics['offset_from_master']) {
-      summary += '\n=== OFFSET FROM MASTER (nanoseconds) ===\n';
-      metrics['offset_from_master'].forEach(metric => {
-        const offset = parseFloat(metric.value);
-        const offsetStatus = Math.abs(offset) > 1000000 ? 'HIGH OFFSET!' : 'Normal';
-        summary += `  ${metric.labels} = ${offset}ns (${offsetStatus})\n`;
-      });
-    }
-
-    summary += '\n=== END SUMMARY ===\n';
-    return summary;
-  }
-
-  isPodReady(pod) {
-    const conditions = pod.status.conditions || [];
-    const readyCondition = conditions.find(c => c.type === 'Ready');
-    return readyCondition?.status === 'True';
-  }
-
-  isContainerReady(pod, containerName) {
-    const containerStatus = pod.status.containerStatuses?.find(c => c.name === containerName);
-    return containerStatus?.ready || false;
-  }
-
-  getPodRestarts(pod) {
-    return pod.status.containerStatuses?.reduce((total, c) => total + c.restartCount, 0) || 0;
-  }
-
-  getAge(timestamp) {
-    const now = new Date();
-    const created = new Date(timestamp);
-    const diffMs = now - created;
-    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-    const diffHours = Math.floor((diffMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
-    const diffMinutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
-
-    if (diffDays > 0) return `${diffDays}d${diffHours}h`;
-    if (diffHours > 0) return `${diffHours}h${diffMinutes}m`;
-    return `${diffMinutes}m`;
-  }
-
-  async run() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error('PTP Operator MCP Server running on stdio');
-  }
-}
-
-// Start the server
-const server = new PTPOperatorMCPServer();
-server.run().catch(console.error);
