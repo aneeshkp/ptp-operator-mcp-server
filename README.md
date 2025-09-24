@@ -8,6 +8,9 @@ A specialized Model Context Protocol (MCP) server for monitoring and managing **
 
 ![PTP MCP Server Demo](https://via.placeholder.com/800x400/1a1a1a/ffffff?text=PTP+MCP+Server+Dashboard)
 
+<img src="images/ptp.png" alt="PTP Operator MCP Server Architecture" width="800" />
+
+
 ## ✨ Features
 
 ### 🔍 **Smart PTP Monitoring**

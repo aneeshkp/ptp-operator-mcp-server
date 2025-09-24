@@ -15,6 +15,7 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import k8s from '@kubernetes/client-node';
+import { Writable } from 'stream';
 
 class PTPOperatorMCPServer {
   constructor() {
@@ -938,4 +939,159 @@ class PTPOperatorMCPServer {
           },
         ],
       };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Failed to get PTP configuration: ${error.message}`);
     }
+  }
+
+  isPodReady(pod) {
+    const conditions = pod.status?.conditions || [];
+    return conditions.some(c => c.type === 'Ready' && c.status === 'True');
+  }
+
+  isContainerReady(pod, containerName) {
+    const statuses = pod.status?.containerStatuses || [];
+    const status = statuses.find(s => s.name === containerName);
+    return Boolean(status?.ready);
+  }
+
+  getPodRestarts(pod) {
+    const statuses = pod.status?.containerStatuses || [];
+    return statuses.reduce((sum, s) => sum + (s.restartCount || 0), 0);
+  }
+
+  getAge(creationTimestamp) {
+    if (!creationTimestamp) return 'unknown';
+    const created = new Date(creationTimestamp).getTime();
+    const now = Date.now();
+    let seconds = Math.max(0, Math.floor((now - created) / 1000));
+    const days = Math.floor(seconds / 86400); seconds -= days * 86400;
+    const hours = Math.floor(seconds / 3600); seconds -= hours * 3600;
+    const minutes = Math.floor(seconds / 60);
+    const parts = [];
+    if (days) parts.push(`${days}d`);
+    if (hours) parts.push(`${hours}h`);
+    if (minutes || parts.length === 0) parts.push(`${minutes}m`);
+    return parts.join(' ');
+  }
+
+  async getFirstPTPPod(namespace) {
+    const response = await this.k8sApi.listNamespacedPod(
+      namespace, undefined, undefined, undefined, undefined, 'app=linuxptp-daemon'
+    );
+    const pods = response.body.items || [];
+    if (!pods.length) {
+      throw new Error(`No pods found with label app=linuxptp-daemon in namespace ${namespace}`);
+    }
+    return pods[0].metadata.name;
+  }
+
+  analyzePTPLogContent(logs) {
+    if (!logs) return 'No logs available';
+    const lines = logs.split('\n');
+    let faultyCount = 0;
+    let offsetWarnings = 0;
+    let clockStep = 0;
+    let roleChanges = 0;
+    for (const line of lines) {
+      const l = line.toLowerCase();
+      if (l.includes('faulty')) faultyCount++;
+      if (l.includes('clock step')) clockStep++;
+      if (l.match(/offset\s*[=:]\s*[-+]?\d+/)) offsetWarnings++;
+      if (l.includes('master') && l.includes('slave')) roleChanges++;
+      if (l.includes('state') && (l.includes('master') || l.includes('slave'))) roleChanges++;
+    }
+    const findings = [];
+    if (faultyCount) findings.push(`FAULTY occurrences: ${faultyCount}`);
+    if (clockStep) findings.push(`Clock step events: ${clockStep}`);
+    if (offsetWarnings) findings.push(`Offset observations: ${offsetWarnings}`);
+    if (roleChanges) findings.push(`Role/state change hints: ${roleChanges}`);
+    if (!findings.length) findings.push('No obvious issues detected in recent logs');
+    return findings.join('\n');
+  }
+
+  performFaultAnalysis(logs) {
+    if (!logs) return 'No logs available';
+    const lines = logs.split('\n');
+    const summary = { faulty: 0, portErrors: 0, clockStep: 0, syncLoss: 0, lastFaultyLine: null };
+    lines.forEach(line => {
+      const l = line.toLowerCase();
+      if (l.includes('faulty')) { summary.faulty++; summary.lastFaultyLine = line; }
+      if (l.includes('clock step')) summary.clockStep++;
+      if (l.includes('sync') && l.includes('lost')) summary.syncLoss++;
+      if (l.includes('port') && (l.includes('down') || l.includes('fault'))) summary.portErrors++;
+    });
+    return JSON.stringify(summary, null, 2);
+  }
+
+  async execCommandInPod(namespace, podName, containerName, command) {
+    return await new Promise((resolve, reject) => {
+      let stdoutData = '';
+      let stderrData = '';
+      const stdoutStream = new Writable({ write(chunk, enc, cb) { stdoutData += chunk.toString(); cb(); } });
+      const stderrStream = new Writable({ write(chunk, enc, cb) { stderrData += chunk.toString(); cb(); } });
+      this.exec.exec(
+        namespace,
+        podName,
+        containerName,
+        command,
+        stdoutStream,
+        stderrStream,
+        null,
+        false,
+        (status) => {
+          if (!status || status.status === 'Success') {
+            resolve(stdoutData);
+          } else {
+            reject(new Error(stderrData || JSON.stringify(status)));
+          }
+        }
+      ).catch(err => reject(err));
+    });
+  }
+
+  parsePrometheusMetrics(text, filterMetric) {
+    const metrics = {};
+    if (!text) return metrics;
+    const lines = text.split('\n');
+    for (const line of lines) {
+      if (!line || line.startsWith('#')) continue;
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 2) continue;
+      const metricAndLabels = parts[0];
+      const value = parseFloat(parts[1]);
+      if (Number.isNaN(value)) continue;
+      const nameMatch = metricAndLabels.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?$/);
+      if (!nameMatch) continue;
+      const metricName = nameMatch[1];
+      if (filterMetric && !metricName.includes(filterMetric)) continue;
+      const labelsRaw = nameMatch[2];
+      const labels = {};
+      if (labelsRaw) {
+        const inner = labelsRaw.slice(1, -1);
+        inner.split(',').forEach(kv => {
+          const [k, v] = kv.split('=');
+          if (k) labels[k.trim()] = v?.trim()?.replace(/^\"|\"$/g, '') || '';
+        });
+      }
+      if (!metrics[metricName]) metrics[metricName] = [];
+      metrics[metricName].push({ labels, value });
+    }
+    return metrics;
+  }
+
+  summarizeMetrics(metrics) {
+    const summary = {};
+    for (const [name, samples] of Object.entries(metrics)) {
+      const count = samples.length;
+      let min = Infinity, max = -Infinity, sum = 0;
+      samples.forEach(s => { min = Math.min(min, s.value); max = Math.max(max, s.value); sum += s.value; });
+      summary[name] = { count, min: isFinite(min) ? min : null, max: isFinite(max) ? max : null, avg: count ? sum / count : null };
+    }
+    return JSON.stringify(summary, null, 2);
+  }
+}
+
+const serverInstance = new PTPOperatorMCPServer();
+const transport = new StdioServerTransport();
+serverInstance.server.connect(transport);
