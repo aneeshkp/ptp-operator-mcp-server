@@ -47,3 +47,4 @@ kubeconfig*
 # Build outputs
 dist/
 build/
+.venv

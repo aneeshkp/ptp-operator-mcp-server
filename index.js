@@ -41,6 +41,8 @@ class PTPOperatorMCPServer {
 
     this.k8sApi = this.kc.makeApiClient(k8s.CoreV1Api);
     this.exec = new k8s.Exec(this.kc);
+    this.appsApi = this.kc.makeApiClient(k8s.AppsV1Api);
+    this.eventsV1Api = this.kc.makeApiClient(k8s.EventsV1Api);
     
     // Custom Resource API clients
     this.customObjectsApi = this.kc.makeApiClient(k8s.CustomObjectsApi);
@@ -51,6 +53,7 @@ class PTPOperatorMCPServer {
       daemon: 'linuxptp-daemon-container',
       proxy: 'cloud-event-proxy'
     };
+    this.ptpDaemonSetName = 'linuxptp-daemon';
 
     this.setupHandlers();
   }
@@ -274,7 +277,7 @@ class PTPOperatorMCPServer {
         },
         {
           name: 'monitor_ptp_events',
-          description: 'Monitor PTP-related Kubernetes events',
+          description: 'Monitor PTP events by parsing cloud-event-proxy logs',
           inputSchema: {
             type: 'object',
             properties: {
@@ -636,7 +639,7 @@ class PTPOperatorMCPServer {
     } = args;
 
     try {
-      const targetPodName = podName || await this.getFirstPTPPod(namespace);
+      const targetPodName = podName || await this.getPodFromDaemonSet(namespace, this.ptpDaemonSetName, this.ptpContainers.proxy);
 
       const response = await this.k8sApi.readNamespacedPodLog(
         targetPodName,
@@ -848,35 +851,40 @@ class PTPOperatorMCPServer {
     const { namespace = this.ptpNamespace, sinceMinutes = 60 } = args;
 
     try {
-      const sinceTime = new Date(Date.now() - sinceMinutes * 60 * 1000).toISOString();
-      
-      const response = await this.k8sApi.listNamespacedEvent(namespace);
-      
-      const ptpEvents = response.body.items
-        .filter(event => {
-          const eventTime = new Date(event.lastTimestamp || event.firstTimestamp);
-          return eventTime >= new Date(sinceTime);
-        })
-        .filter(event => 
-          event.involvedObject.name?.includes('ptp') ||
-          event.involvedObject.name?.includes('linuxptp') ||
-          event.message?.toLowerCase().includes('ptp')
-        )
-        .map(event => ({
-          type: event.type,
-          reason: event.reason,
-          message: event.message,
-          object: `${event.involvedObject.kind}/${event.involvedObject.name}`,
-          count: event.count,
-          firstTime: event.firstTimestamp,
-          lastTime: event.lastTimestamp
-        }));
+      const sinceMs = Date.now() - sinceMinutes * 60 * 1000;
+
+      // Aggregate cloud-event-proxy logs from all DS pods
+      const podNames = await this.listPodsForDaemonSetWithContainer(namespace, this.ptpDaemonSetName, this.ptpContainers.proxy);
+      const sinceSeconds = Math.max(60, Math.floor(sinceMinutes * 60));
+      let combinedLogs = '';
+      for (const pod of podNames) {
+        try {
+          const resp = await this.k8sApi.readNamespacedPodLog(
+            pod,
+            namespace,
+            this.ptpContainers.proxy,
+            undefined, undefined, undefined, undefined,
+            sinceSeconds, 3000, true
+          );
+          combinedLogs += (resp.body || '') + '\n';
+        } catch (_) {}
+      }
+
+      // Parse and filter events by time
+      const allEvents = this.extractCloudEventsFromLogs(combinedLogs);
+      const filtered = allEvents.filter(ev => {
+        const t = Date.parse(ev?.time || '');
+        return !Number.isNaN(t) && t >= sinceMs;
+      });
+      const simplified = filtered
+        .map(ev => this.simplifyCloudEvent(ev))
+        .sort((a, b) => (Date.parse(b.time || '') || 0) - (Date.parse(a.time || '') || 0));
 
       return {
         content: [
           {
             type: 'text',
-            text: `PTP Events in namespace ${namespace} (last ${sinceMinutes} minutes):\n\n${JSON.stringify(ptpEvents, null, 2)}`,
+            text: `PTP Events from cloud-event-proxy logs (last ${sinceMinutes} minutes):\n\n${JSON.stringify(simplified.slice(0, 50), null, 2)}`,
           },
         ],
       };
@@ -884,6 +892,22 @@ class PTPOperatorMCPServer {
       throw new McpError(ErrorCode.InternalError, `Failed to monitor PTP events: ${error.message}`);
     }
   }
+
+  normalizeCoreV1Event(e) {
+    const timeStr = e.lastTimestamp || e.firstTimestamp || e.eventTime;
+    const time = timeStr ? new Date(timeStr) : undefined;
+    return {
+      type: e.type,
+      reason: e.reason,
+      message: e.message,
+      objectKind: e.involvedObject?.kind,
+      objectName: e.involvedObject?.name,
+      count: e.count,
+      time,
+    };
+  }
+
+  // Note: events.events.k8s.io not used per user preference
 
   async getPTPConfig(args) {
     const { 
@@ -944,6 +968,218 @@ class PTPOperatorMCPServer {
     }
   }
 
+  async getCloudEvents(args) {
+    const {
+      namespace = this.ptpNamespace,
+      podName,
+      count = 10,
+      eventType = 'all',
+      sinceMinutes = 30,
+      includeMetrics = true, // reserved for future use
+    } = args;
+
+    try {
+      const targetPodName = podName || await this.getPodFromDaemonSet(namespace, this.ptpDaemonSetName, this.ptpContainers.proxy);
+      const sinceSeconds = sinceMinutes * 60;
+
+      // Collect logs from all DS pods that have the proxy container (oc logs ds/... aggregates)
+      const podNames = await this.listPodsForDaemonSetWithContainer(namespace, this.ptpDaemonSetName, this.ptpContainers.proxy);
+      let combinedLogs = '';
+      for (const pod of podNames) {
+        try {
+          const resp = await this.k8sApi.readNamespacedPodLog(
+            pod,
+            namespace,
+            this.ptpContainers.proxy,
+            undefined, // follow
+            undefined, // insecureSkipTLSVerifyBackend
+            undefined, // limitBytes
+            undefined, // pretty
+            undefined, // previous
+            sinceSeconds,
+            3000, // tailLines per pod
+            true // timestamps
+          );
+          combinedLogs += (resp.body || '') + '\n';
+        } catch (e) {
+          // Skip pods we can't read
+        }
+      }
+
+      const allEvents = this.extractCloudEventsFromLogs(combinedLogs);
+
+      const filtered = allEvents.filter(ev => {
+        if (eventType === 'all') return true;
+        const t = (ev.type || '').toLowerCase();
+        if (eventType === 'sync-state') return t.includes('sync-status') || t.includes('synchronization');
+        if (eventType === 'lock-state') return t.includes('lock');
+        if (eventType === 'clock-class') return t.includes('clock-class');
+        return true;
+      });
+
+      // Sort by time desc when possible
+      const sorted = filtered.sort((a, b) => {
+        const ta = Date.parse(a.time || '');
+        const tb = Date.parse(b.time || '');
+        if (Number.isNaN(ta) && Number.isNaN(tb)) return 0;
+        if (Number.isNaN(ta)) return 1;
+        if (Number.isNaN(tb)) return -1;
+        return tb - ta;
+      });
+
+      const selected = sorted.slice(0, Math.max(0, count));
+      const simplified = selected.map(ev => this.simplifyCloudEvent(ev));
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Cloud Event Proxy events from pod ${targetPodName} (first ${simplified.length} of ${filtered.length}, window ${sinceMinutes}m):\n\n${JSON.stringify(simplified, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Failed to get cloud events: ${error.message}`);
+    }
+  }
+
+  extractCloudEventsFromLogs(logs) {
+    const lines = logs.split('\n');
+    const events = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const idx = line.toLowerCase().indexOf('event sent');
+      if (idx === -1) continue;
+
+      // Try fast-path: JSON contained within the same line (escaped newlines/quotes)
+      const braceStart = line.indexOf('{', idx);
+      const braceEnd = line.lastIndexOf('}');
+      if (braceStart !== -1 && braceEnd !== -1 && braceEnd > braceStart) {
+        const candidate = line.slice(braceStart, braceEnd + 1);
+        const obj = this.tryParseJsonCandidate(candidate);
+        if (obj) { events.push(obj); continue; }
+      }
+
+      // Fallback: multi-line JSON object following the log line
+      let startLine = i;
+      let startCol = braceStart;
+      if (startCol === -1) {
+        for (let j = i + 1; j < lines.length; j++) {
+          const col = lines[j].indexOf('{');
+          if (col !== -1) { startLine = j; startCol = col; break; }
+        }
+      }
+      if (startCol === -1) continue;
+
+      const parsed = this.parseJsonObjectFromLines(lines, startLine, startCol);
+      if (parsed && parsed.obj) { events.push(parsed.obj); i = parsed.endLine; }
+    }
+    return events;
+  }
+
+  parseJsonObjectFromLines(lines, startLine, startCol) {
+    let buffer = '';
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = startLine; i < lines.length; i++) {
+      const line = lines[i];
+      const start = i === startLine ? startCol : 0;
+      for (let j = start; j < line.length; j++) {
+        const ch = line[j];
+        buffer += ch;
+        if (inString) {
+          if (escape) {
+            escape = false;
+          } else if (ch === '\\') {
+            escape = true;
+          } else if (ch === '"') {
+            inString = false;
+          }
+          continue;
+        }
+        if (ch === '"') {
+          inString = true;
+          continue;
+        }
+        if (ch === '{') depth++;
+        else if (ch === '}') depth--;
+
+        if (depth === 0) {
+          // Attempt to parse
+          try {
+            const obj = JSON.parse(buffer);
+            return { obj, endLine: i };
+          } catch (e) {
+            // Some logs escape quotes within the JSON fragment; try unescaping common sequences
+            try {
+              const cleaned = buffer
+                .replace(/\\n/g, '\n')
+                .replace(/\\t/g, '\t')
+                .replace(/\\r/g, '')
+                .replace(/\\\"/g, '"');
+              const obj2 = JSON.parse(cleaned);
+              return { obj: obj2, endLine: i };
+            } catch (_e) {
+              // keep scanning
+            }
+          }
+        }
+      }
+      buffer += '\n';
+    }
+    return null;
+  }
+
+  tryParseJsonCandidate(text) {
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      try {
+        const cleaned = text
+          .replace(/\\n/g, '\n')
+          .replace(/\\t/g, '\t')
+          .replace(/\\r/g, '')
+          .replace(/\\\"/g, '"');
+        return JSON.parse(cleaned);
+      } catch (_) {
+        return null;
+      }
+    }
+  }
+
+  async listPodsForDaemonSetWithContainer(namespace, daemonSetName, containerName) {
+    const ds = await this.appsApi.readNamespacedDaemonSet(daemonSetName, namespace);
+    const selector = ds.body.spec?.selector?.matchLabels || {};
+    const labelSelector = Object.entries(selector).map(([k, v]) => `${k}=${v}`).join(',');
+    const podsResp = await this.k8sApi.listNamespacedPod(namespace, undefined, undefined, undefined, undefined, labelSelector);
+    const pods = podsResp.body.items || [];
+    const names = pods.filter(p => (p.spec?.containers || []).some(c => c.name === containerName)).map(p => p.metadata.name);
+    if (names.length) return names;
+    // Fallback to app label
+    const fallbackResp = await this.k8sApi.listNamespacedPod(namespace, undefined, undefined, undefined, undefined, 'app=linuxptp-daemon');
+    return (fallbackResp.body.items || [])
+      .filter(p => (p.spec?.containers || []).some(c => c.name === containerName))
+      .map(p => p.metadata.name);
+  }
+
+  simplifyCloudEvent(ev) {
+    const values = ev?.data?.values || [];
+    const flatValues = values.map(v => ({
+      address: v?.ResourceAddress,
+      dataType: v?.data_type,
+      valueType: v?.value_type,
+      value: v?.value
+    }));
+    return {
+      id: ev?.id,
+      type: ev?.type,
+      source: ev?.source,
+      time: ev?.time,
+      values: flatValues
+    };
+  }
+
   isPodReady(pod) {
     const conditions = pod.status?.conditions || [];
     return conditions.some(c => c.type === 'Ready' && c.status === 'True');
@@ -984,6 +1220,28 @@ class PTPOperatorMCPServer {
       throw new Error(`No pods found with label app=linuxptp-daemon in namespace ${namespace}`);
     }
     return pods[0].metadata.name;
+  }
+
+  // Prefer pods owned by the linuxptp-daemon DaemonSet and that include the requested container
+  async getPodFromDaemonSet(namespace, daemonSetName, containerName) {
+    // Find DaemonSet to get selector
+    const ds = await this.appsApi.readNamespacedDaemonSet(daemonSetName, namespace);
+    const selector = ds.body.spec?.selector?.matchLabels || {};
+    const labelSelector = Object.entries(selector).map(([k,v]) => `${k}=${v}`).join(',');
+
+    // List pods matching the DS selector
+    const podsResp = await this.k8sApi.listNamespacedPod(namespace, undefined, undefined, undefined, undefined, labelSelector);
+    const pods = podsResp.body.items || [];
+    // Filter to pods that have the container
+    const withContainer = pods.filter(p => (p.spec?.containers || []).some(c => c.name === containerName));
+    if (withContainer.length) return withContainer[0].metadata.name;
+
+    // Fallback: any app=linuxptp-daemon pod with container
+    const fallbackResp = await this.k8sApi.listNamespacedPod(namespace, undefined, undefined, undefined, undefined, 'app=linuxptp-daemon');
+    const fallbackPods = (fallbackResp.body.items || []).filter(p => (p.spec?.containers || []).some(c => c.name === containerName));
+    if (fallbackPods.length) return fallbackPods[0].metadata.name;
+
+    throw new Error(`No pods found in ${namespace} with container ${containerName}`);
   }
 
   analyzePTPLogContent(logs) {

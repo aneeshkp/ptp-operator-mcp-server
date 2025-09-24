@@ -73,7 +73,7 @@ Add to your Claude Desktop configuration file:
 }
 ```
 
-### Verify Installation
+### Verify Installation (Node)
 
 ```bash
 # Test cluster access
@@ -82,6 +82,29 @@ kubectl get pods -n openshift-ptp -l app=linuxptp-daemon
 # Test the MCP server
 node index.js
 # Should show: "PTP Operator MCP Server running on stdio"
+```
+
+### Python Alternative (Experimental)
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python server.py
+```
+
+Update Claude config to use Python server:
+
+```json
+{
+  "mcpServers": {
+    "ptp-operator": {
+      "command": "/usr/bin/python3",
+      "args": ["/home/aputtur/github.com/aneeshkp/ptp-operator-mcp-server/server.py"],
+      "env": { "KUBECONFIG": "/home/aputtur/.kube/config" }
+    }
+  }
+}
 ```
 
 ## 🛠️ Available Tools
