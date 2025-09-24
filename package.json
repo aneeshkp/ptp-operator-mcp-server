@@ -1,0 +1,46 @@
+{
+  "name": "ptp-operator-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for OpenShift PTP Operator monitoring and management",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "ptp-mcp-server": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --inspect index.js",
+    "test": "echo \"Tests not implemented yet\" && exit 0",
+    "lint": "echo \"Linting not implemented yet\" && exit 0"
+  },
+  "keywords": [
+    "mcp",
+    "ptp",
+    "openshift",
+    "linuxptp",
+    "precision-time-protocol",
+    "kubernetes",
+    "claude",
+    "monitoring"
+  ],
+  "author": "Your Name <your.email@example.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/ptp-operator-mcp-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yourusername/ptp-operator-mcp-server/issues"
+  },
+  "homepage": "https://github.com/yourusername/ptp-operator-mcp-server#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^0.4.0",
+    "@kubernetes/client-node": "^0.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

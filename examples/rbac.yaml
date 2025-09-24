@@ -1,0 +1,30 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ptp-mcp-server
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log", "pods/exec", "events", "namespaces"]
+  verbs: ["get", "list", "create"]
+- apiGroups: ["ptp.openshift.io"]
+  resources: ["ptpconfigs", "nodeptpdevices"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ptp-mcp-server-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ptp-mcp-server
+subjects:
+- kind: ServiceAccount
+  name: ptp-mcp-server
+  namespace: openshift-ptp
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ptp-mcp-server
+  namespace: openshift-ptp
