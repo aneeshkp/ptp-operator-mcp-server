@@ -11,5 +11,5 @@
 
 1. **Clone the repository**:
 ```bash
-   git clone https://github.com/yourusername/ptp-operator-mcp-server.git
+   git clone https://github.com/aneeshkp/ptp-operator-mcp-server.git
    cd ptp-operator-mcp-server

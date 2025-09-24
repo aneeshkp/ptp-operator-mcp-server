@@ -27,12 +27,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/ptp-operator-mcp-server.git"
+    "url": "https://github.com/aneeshkp/ptp-operator-mcp-server.git"
   },
   "bugs": {
-    "url": "https://github.com/yourusername/ptp-operator-mcp-server/issues"
+    "url": "https://github.com/aneeshkp/ptp-operator-mcp-server/issues"
   },
-  "homepage": "https://github.com/yourusername/ptp-operator-mcp-server#readme",
+  "homepage": "https://github.com/aneeshkp/ptp-operator-mcp-server#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^0.4.0",
     "@kubernetes/client-node": "^0.20.0"
