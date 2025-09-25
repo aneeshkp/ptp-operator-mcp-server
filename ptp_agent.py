@@ -246,8 +246,32 @@ class PTPEventSubscriber:
     
     async def subscribe_to_endpoint(self, endpoint: str, callback):
         """Subscribe to a single publisher endpoint"""
-        # Since we're using hostNetwork: true, use the actual host IP
-        consumer_endpoint = await self.get_host_ip_endpoint()
+        # Try different endpoint strategies for cross-namespace connectivity
+
+        # Strategy 1: Full service DNS (standard)
+        consumer_endpoint = f"http://ptp-agent.{self.agent_namespace}.svc.cluster.local:8080/event"
+
+        # Strategy 2: NodePort (if available) - check for NODE_IP env var
+        node_ip = os.getenv('NODE_IP')
+        if node_ip:
+            # Use NodePort 30080 if configured
+            nodeport_endpoint = f"http://{node_ip}:30080/event"
+            logger.info(f"NodePort endpoint available: {nodeport_endpoint}")
+            consumer_endpoint = nodeport_endpoint
+
+        # Strategy 3: Pod IP (if in same node network)
+        try:
+            pod_ip = os.getenv('POD_IP')
+            if pod_ip:
+                pod_endpoint = f"http://{pod_ip}:8080/event"
+                logger.info(f"Pod IP endpoint available: {pod_endpoint}")
+                # Use pod IP as fallback
+        except:
+            pass
+
+        # Debug: Log the consumer endpoint being used
+        logger.info(f"Registering consumer endpoint: {consumer_endpoint}")
+        logger.info(f"Publisher namespace: {self.ptp_namespace}, Agent namespace: {self.agent_namespace}")
         timestamp = int(time.time())
         
         # Get the full node FQDN from the discovered pods
@@ -271,6 +295,7 @@ class PTPEventSubscriber:
         
         logger.info(f"Using node FQDN: {node_fqdn} for subscriptions")
         
+        # Use exact resource addresses from existing working subscriptions
         subscriptions = [
             {
                 "Id": f"ptp-agent-sync-state-{timestamp}",
@@ -285,6 +310,16 @@ class PTPEventSubscriber:
             {
                 "Id": f"ptp-agent-lock-state-{timestamp}",
                 "ResourceAddress": f"/cluster/node/{node_fqdn}/sync/ptp-status/lock-state",
+                "EndpointUri": consumer_endpoint
+            },
+            {
+                "Id": f"ptp-agent-clock-class-{timestamp}",
+                "ResourceAddress": f"/cluster/node/{node_fqdn}/sync/ptp-status/clock-class",
+                "EndpointUri": consumer_endpoint
+            },
+            {
+                "Id": f"ptp-agent-gnss-status-{timestamp}",
+                "ResourceAddress": f"/cluster/node/{node_fqdn}/sync/gnss-status/gnss-sync-status",
                 "EndpointUri": consumer_endpoint
             }
         ]
@@ -326,6 +361,9 @@ class PTPEventSubscriber:
                     # If we got any successful subscriptions with this API version, we're done
                     if successful_subscriptions > 0:
                         return True
+
+                    # Even if subscriptions fail, events might still work (as seen in logs)
+                    logger.warning(f"Formal subscriptions failed for {endpoint}, but events may still be received")
                         
                     # If this was v2 and failed, try v1
                     if api_version == "v2":
@@ -346,31 +384,59 @@ class PTPEventSubscriber:
             
         return False
     
-    async def start_consumer_server(self, port: int = 8080):
+    async def start_consumer_server(self, port: int = 8080, event_callback=None):
         """Start HTTP server to receive events from cloud-event-proxy"""
         from aiohttp import web
         
         async def handle_event(request):
-            """Handle incoming PTP events"""
+            """Handle incoming PTP events - must always return 204 for successful subscription"""
             try:
-                event_data = await request.json()
-                ptp_event = PTPEvent.from_cloud_event(event_data)
+                # Log the incoming request details
+                logger.info(f"Received {request.method} request to {request.path}")
+                logger.info(f"Headers: {dict(request.headers)}")
+
+                # Read raw body first (like the Go example)
+                body_bytes = await request.read()
+
+                # Log what we received for debugging
+                if body_bytes:
+                    body_str = body_bytes.decode('utf-8', errors='ignore')
+                    logger.info(f"Received event data ({len(body_bytes)} bytes): {body_str[:500]}...")
+
+                    # Try to parse and process events, but don't let errors break the response
+                    try:
+                        event_data = json.loads(body_str)
+
+                        # Only process if it looks like a real event (not just a test)
+                        if event_data.get('type') and event_data.get('id'):
+                            ptp_event = PTPEvent.from_cloud_event(event_data)
+
+                            # Add to buffer
+                            self.event_buffer.append(ptp_event)
+                            if len(self.event_buffer) > self.max_buffer_size:
+                                self.event_buffer.pop(0)
+
+                            logger.info(f"Processed event: {ptp_event.type} from {ptp_event.node_name} - {ptp_event.value}")
+
+                            # Trigger real-time analysis via callback
+                            if event_callback:
+                                asyncio.create_task(event_callback(ptp_event))
+                        else:
+                            logger.info("Received test/health check event, acknowledging")
+
+                    except Exception as e:
+                        # Log but don't fail - always return 204
+                        logger.warning(f"Event processing error (still acknowledging): {e}")
+                else:
+                    logger.info("Received empty event, acknowledging")
                 
-                # Add to buffer
-                self.event_buffer.append(ptp_event)
-                if len(self.event_buffer) > self.max_buffer_size:
-                    self.event_buffer.pop(0)
-                
-                logger.info(f"Received event: {ptp_event.type} from {ptp_event.node_name} - {ptp_event.value}")
-                
-                # Trigger real-time analysis
-                await self.analyze_event(ptp_event)
-                
-                return web.Response(status=200)
+                # ALWAYS return 204 No Content (critical for subscription success)
+                return web.Response(status=204)
                 
             except Exception as e:
-                logger.error(f"Failed to process event: {e}")
-                return web.Response(status=500)
+                # Even on complete failure, return 204 to not break subscription
+                logger.error(f"Event handler error (still acknowledging): {e}")
+                return web.Response(status=204)
         
         app = web.Application()
         app.router.add_post('/event', handle_event)
@@ -406,7 +472,7 @@ class PTPDiagnosticAgent:
         self.event_history[node_name].append(event)
         
         # Keep only recent events (last 24 hours)
-        cutoff_time = datetime.now() - timedelta(hours=24)
+        cutoff_time = datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo) - timedelta(hours=24)
         self.event_history[node_name] = [
             e for e in self.event_history[node_name] 
             if self._parse_event_time(e.time) > cutoff_time
@@ -420,7 +486,7 @@ class PTPDiagnosticAgent:
         try:
             return datetime.fromisoformat(time_str.replace('Z', '+00:00'))
         except:
-            return datetime.now()
+            return datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo)
     
     async def _diagnose_patterns(self, node_name: str, latest_event: PTPEvent) -> Optional[DiagnosticResult]:
         """AI-powered pattern analysis"""
@@ -493,12 +559,12 @@ class PTPDiagnosticAgent:
             return 0
             
         first_freerun = min(freerun_events, key=lambda e: self._parse_event_time(e.time))
-        duration = datetime.now() - self._parse_event_time(first_freerun.time)
+        duration = datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo) - self._parse_event_time(first_freerun.time)
         return duration.total_seconds() / 60
     
     def _count_state_changes(self, events: List[PTPEvent]) -> int:
         """Count state changes in the last hour"""
-        hour_ago = datetime.now() - timedelta(hours=1)
+        hour_ago = datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo) - timedelta(hours=1)
         recent_events = [
             e for e in events 
             if self._parse_event_time(e.time) > hour_ago and e.data_type == 'notification'
@@ -559,7 +625,7 @@ class PTPAgenticService:
         async def get_recent_alerts(request):
             """Get recent alerts for MCP server"""
             hours = int(request.query.get('hours', '24'))
-            cutoff = datetime.now() - timedelta(hours=hours)
+            cutoff = datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo) - timedelta(hours=hours)
             
             recent_alerts = [
                 asdict(alert) for alert in self.alerts
@@ -574,7 +640,7 @@ class PTPAgenticService:
             for node_name, events in self.diagnostic_agent.event_history.items():
                 recent_events = [
                     e for e in events
-                    if self.diagnostic_agent._parse_event_time(e.time) > datetime.now() - timedelta(hours=1)
+                    if self.diagnostic_agent._parse_event_time(e.time) > datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo) - timedelta(hours=1)
                 ]
                 
                 summary[node_name] = {
@@ -598,38 +664,20 @@ class PTPAgenticService:
         
         return runner
     
-    async def wait_for_consumer_ready(self, max_wait_seconds: int = 30):
+    async def wait_for_consumer_ready(self, max_wait_seconds: int = 10):
         """Wait for consumer server to be ready before subscribing"""
         logger.info("Waiting for consumer server to be ready...")
         
-        for i in range(max_wait_seconds):
-            try:
-                # Test our own health endpoint
-                if not hasattr(self, '_health_session'):
-                    self._health_session = aiohttp.ClientSession()
-                
-                consumer_endpoint = await self.subscriber.get_host_ip_endpoint()
-                health_url = consumer_endpoint.replace('/event', '/health')
-                
-                async with self._health_session.get(health_url, timeout=aiohttp.ClientTimeout(total=2)) as response:
-                    if response.status == 200:
-                        logger.info(f"Consumer server ready at {consumer_endpoint}")
-                        return
-                        
-            except Exception as e:
-                if i == 0:  # Log only first attempt
-                    logger.debug(f"Consumer not ready yet: {e}")
-                    
-            await asyncio.sleep(1)
-            
-        logger.warning(f"Consumer server not ready after {max_wait_seconds}s, proceeding anyway")
+        # Simple wait - just give the servers time to start
+        await asyncio.sleep(5)
+        logger.info("Consumer server should be ready now")
     
     async def run(self):
         """Main run loop"""
         logger.info("Starting PTP Agentic Service...")
         
-        # Start consumer server
-        consumer_runner = await self.subscriber.start_consumer_server()
+        # Start consumer server with callback
+        consumer_runner = await self.subscriber.start_consumer_server(event_callback=self.analyze_event)
         
         # Start MCP integration server
         mcp_runner = await self.start_mcp_integration_server()

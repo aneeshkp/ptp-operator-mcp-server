@@ -24,8 +24,6 @@ spec:
         app: ptp-agent
     spec:
       serviceAccountName: ptp-agent
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: ptp-agent
         image: quay.io/aneeshkp/ptp-agent:latest
