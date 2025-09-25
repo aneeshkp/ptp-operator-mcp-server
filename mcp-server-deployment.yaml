@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ptp-mcp-system
+  labels:
+    name: ptp-mcp-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ptp-mcp-server
+  namespace: ptp-mcp-system
+  labels:
+    app: ptp-mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ptp-mcp-server
+  template:
+    metadata:
+      labels:
+        app: ptp-mcp-server
+    spec:
+      serviceAccountName: ptp-mcp-server
+      containers:
+      - name: ptp-mcp-server
+        image: quay.io/aneeshkp/ptp-mcp-server:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: mcp-server
+        env:
+        - name: PTP_AGENT_URL
+          value: "http://ptp-agent.ptp-agent-system.svc.cluster.local:8081"
+        - name: NODE_ENV
+          value: "production"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: kubeconfig
+          mountPath: /etc/kubeconfig
+          readOnly: true
+      volumes:
+      - name: kubeconfig
+        secret:
+          secretName: ptp-mcp-kubeconfig
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptp-mcp-server
+  namespace: ptp-mcp-system
+  labels:
+    app: ptp-mcp-server
+spec:
+  selector:
+    app: ptp-mcp-server
+  ports:
+  - name: mcp-server
+    port: 3000
+    targetPort: 3000
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ptp-mcp-server
+  namespace: ptp-mcp-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ptp-mcp-server
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log", "pods/exec", "events", "nodes"]
+  verbs: ["get", "list", "watch", "create"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list"]
+- apiGroups: ["ptp.openshift.io"]
+  resources: ["ptpconfigs", "nodeptpdevices"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ptp-mcp-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ptp-mcp-server
+subjects:
+- kind: ServiceAccount
+  name: ptp-mcp-server
+  namespace: ptp-mcp-system

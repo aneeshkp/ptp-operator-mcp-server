@@ -9,7 +9,9 @@
   },
   "scripts": {
     "start": "node index.js",
+    "start:http": "node index-tcp.js",
     "dev": "node --inspect index.js",
+    "dev:http": "node --inspect index-tcp.js",
     "test": "echo \"Tests not implemented yet\" && exit 0",
     "lint": "echo \"Linting not implemented yet\" && exit 0"
   },
@@ -34,8 +36,10 @@
   },
   "homepage": "https://github.com/aneeshkp/ptp-operator-mcp-server#readme",
   "dependencies": {
+    "@kubernetes/client-node": "^0.20.0",
     "@modelcontextprotocol/sdk": "^0.4.0",
-    "@kubernetes/client-node": "^0.20.0"
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
   },
   "devDependencies": {
     "@types/node": "^20.0.0"

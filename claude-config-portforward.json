@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ptp-operator": {
+      "command": "nc",
+      "args": ["localhost", "3000"],
+      "env": {}
+    }
+  }
+}

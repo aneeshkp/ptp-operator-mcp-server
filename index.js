@@ -54,6 +54,9 @@ class PTPOperatorMCPServer {
       proxy: 'cloud-event-proxy'
     };
     this.ptpDaemonSetName = 'linuxptp-daemon';
+    
+    // Agentic service integration
+    this.agentServiceUrl = process.env.PTP_AGENT_URL || 'http://ptp-agent.ptp-agent.svc.cluster.local:8081';
 
     this.setupHandlers();
   }
@@ -391,6 +394,39 @@ class PTPOperatorMCPServer {
               }
             }
           }
+        },
+        {
+          name: 'get_agent_alerts',
+          description: 'Get real-time alerts from PTP agentic service',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              hours: {
+                type: 'number',
+                description: 'Hours of alert history to retrieve (default: 24)',
+                default: 24
+              },
+              severity: {
+                type: 'string',
+                description: 'Filter by severity level',
+                enum: ['INFO', 'WARNING', 'CRITICAL', 'all'],
+                default: 'all'
+              }
+            }
+          }
+        },
+        {
+          name: 'get_agent_summary',
+          description: 'Get real-time PTP event summary from agentic service',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              nodeName: {
+                type: 'string',
+                description: 'Specific node name (optional)'
+              }
+            }
+          }
         }
       ]
     }));
@@ -426,6 +462,10 @@ class PTPOperatorMCPServer {
             return await this.diagnosePTPIssues(args);
           case 'get_cloud_events':
             return await this.getCloudEvents(args);
+          case 'get_agent_alerts':
+            return await this.getAgentAlerts(args);
+          case 'get_agent_summary':
+            return await this.getAgentSummary(args);
           default:
             throw new McpError(ErrorCode.MethodNotFound, `Tool ${name} not found`);
         }
@@ -1180,6 +1220,81 @@ class PTPOperatorMCPServer {
     };
   }
 
+  // Agentic service integration methods
+  async getAgentAlerts(args) {
+    const { hours = 24, severity = 'all' } = args;
+    
+    try {
+      const response = await fetch(`${this.agentServiceUrl}/alerts?hours=${hours}`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 10000
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Agent service responded with ${response.status}`);
+      }
+      
+      const alerts = await response.json();
+      const filtered = severity === 'all' ? alerts : alerts.filter(a => a.severity === severity.toUpperCase());
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `PTP Agent Alerts (${filtered.length} alerts in last ${hours}h):\n\n${JSON.stringify(filtered, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Failed to connect to PTP agent service: ${error.message}\n\nEnsure the PTP agentic service is running and accessible at ${this.agentServiceUrl}`,
+          },
+        ],
+      };
+    }
+  }
+
+  async getAgentSummary(args) {
+    const { nodeName } = args;
+    
+    try {
+      const response = await fetch(`${this.agentServiceUrl}/summary`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 10000
+      });
+      
+      if (!response.ok) {
+        throw new Error(`Agent service responded with ${response.status}`);
+      }
+      
+      const summary = await response.json();
+      const filtered = nodeName ? { [nodeName]: summary[nodeName] } : summary;
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `PTP Agent Event Summary:\n\n${JSON.stringify(filtered, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Failed to connect to PTP agent service: ${error.message}\n\nEnsure the PTP agentic service is running and accessible at ${this.agentServiceUrl}`,
+          },
+        ],
+      };
+    }
+  }
+
   isPodReady(pod) {
     const conditions = pod.status?.conditions || [];
     return conditions.some(c => c.type === 'Ready' && c.status === 'True');
@@ -1350,6 +1465,12 @@ class PTPOperatorMCPServer {
   }
 }
 
-const serverInstance = new PTPOperatorMCPServer();
-const transport = new StdioServerTransport();
-serverInstance.server.connect(transport);
+// Export the class for reuse in other modules
+export { PTPOperatorMCPServer };
+
+// Only start stdio server if this is the main module
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const serverInstance = new PTPOperatorMCPServer();
+  const transport = new StdioServerTransport();
+  serverInstance.server.connect(transport);
+}

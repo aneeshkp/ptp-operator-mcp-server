@@ -1,0 +1,198 @@
+# Complete Kubernetes deployment for Enhanced PTP MCP Server
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ptp-mcp-system
+  labels:
+    name: ptp-mcp-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ptp-mcp-server
+  namespace: ptp-mcp-system
+  labels:
+    app: ptp-mcp-server
+    version: v2.0.0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ptp-mcp-server
+  template:
+    metadata:
+      labels:
+        app: ptp-mcp-server
+        version: v2.0.0
+    spec:
+      serviceAccountName: ptp-mcp-server
+      containers:
+      - name: ptp-mcp-server
+        image: quay.io/aneeshkp/ptp-mcp-server:latest
+        ports:
+        - containerPort: 3000
+          name: http
+          protocol: TCP
+        
+        # Environment variables from Downward API
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: MCP_SERVER_PORT
+          value: "3000"
+        - name: MCP_SERVER_HOST
+          value: "0.0.0.0"
+        - name: LOG_LEVEL
+          value: "INFO"
+        
+        # Kubernetes info from Downward API
+        - name: KUBERNETES_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: SERVICE_ACCOUNT
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.serviceAccountName
+        
+        # Volume mounts for Downward API files
+        volumeMounts:
+        - name: podinfo
+          mountPath: /etc/podinfo
+          readOnly: true
+        
+        # Resource limits
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 3000
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # Security context
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          runAsGroup: 1001
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+      
+      # Volumes for Downward API
+      volumes:
+      - name: podinfo
+        downwardAPI:
+          items:
+          - path: "nodename"
+            fieldRef:
+              fieldPath: spec.nodeName
+          - path: "podname"
+            fieldRef:
+              fieldPath: metadata.name
+          - path: "podnamespace"
+            fieldRef:
+              fieldPath: metadata.namespace
+          - path: "podip"
+            fieldRef:
+              fieldPath: status.podIP
+          - path: "spec.nodeName"
+            fieldRef:
+              fieldPath: spec.nodeName
+      
+      # Restart policy
+      restartPolicy: Always
+
+---
+# ServiceAccount for RBAC
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ptp-mcp-server
+  namespace: ptp-mcp-system
+  labels:
+    app: ptp-mcp-server
+
+---
+# ClusterRole for accessing PTP resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ptp-mcp-server
+  labels:
+    app: ptp-mcp-server
+rules:
+# Pod and Service discovery
+- apiGroups: [""]
+  resources: ["pods", "services", "endpoints", "nodes"]
+  verbs: ["get", "list", "watch"]
+
+# ConfigMaps and Secrets
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+
+# Events
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch", "create"]
+
+# Deployment and DaemonSet access
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets", "replicasets"]
+  verbs: ["get", "list", "watch"]
+
+# PTP-specific resources
+- apiGroups: ["ptp.openshift.io"]
+  resources: ["ptpconfigs", "ptpoperatorconfigs", "nodeptpdevices"]
+  verbs: ["get", "list", "watch"]
+
+---
+# ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ptp-mcp-server
+  labels:
+    app: ptp-mcp-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ptp-mcp-server
+subjects:
+- kind: ServiceAccount
+  name: ptp-mcp-server
+  namespace: ptp-mcp-system

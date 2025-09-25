@@ -1,0 +1,63 @@
+# Internal ClusterIP Service for event callbacks
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptp-mcp-server-service
+  namespace: ptp-mcp-system
+  labels:
+    app: ptp-mcp-server
+    service-type: internal
+spec:
+  type: ClusterIP
+  selector:
+    app: ptp-mcp-server
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+    protocol: TCP
+
+---
+# External LoadBalancer Service for Claude access
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptp-mcp-server-external
+  namespace: ptp-mcp-system
+  labels:
+    app: ptp-mcp-server
+    service-type: external
+spec:
+  type: LoadBalancer
+  selector:
+    app: ptp-mcp-server
+  ports:
+  - name: http
+    port: 80
+    targetPort: 3000
+    protocol: TCP
+  - name: https
+    port: 443
+    targetPort: 3000
+    protocol: TCP
+
+---
+# NodePort Service for development/testing
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptp-mcp-server-nodeport
+  namespace: ptp-mcp-system
+  labels:
+    app: ptp-mcp-server
+    service-type: nodeport
+spec:
+  type: NodePort
+  selector:
+    app: ptp-mcp-server
+  ports:
+  - name: http
+    port: 3000
+    targetPort: 3000
+    nodePort: 30300
+    protocol: TCP
