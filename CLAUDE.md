@@ -187,6 +187,42 @@ If you prefer direct cluster access without port forwarding:
 - "Get PTP agent summary" - Should return current PTP status
 - "Start PTP monitoring" - Should begin continuous monitoring
 
+### PTP Agent Alert Behavior
+
+The PTP agentic service generates **immediate alerts** for any state changes:
+
+#### 🔴 **CRITICAL Alerts (Immediate)**
+- **FREERUN state**: PTP synchronization completely lost
+- **Clock class ≥248**: Poor or no synchronization quality
+- **FAULTY state**: Hardware or configuration issues
+
+#### 🟡 **WARNING Alerts (Immediate)**
+- **HOLDOVER state**: Temporary loss of sync reference (using last known offset)
+- **Clock class changes**: Any change from baseline (6→7, 6→248, etc.)
+- **State transitions**: Any deviation from LOCKED state
+
+#### 🔵 **INFO Alerts (Immediate)**
+- **LOCKED state**: Recovery to synchronized state
+- **Clock class 6**: Return to optimal synchronization quality
+
+#### 📊 **Pattern-Based Alerts (Historical)**
+- **Persistent FREERUN**: Duration > 5 minutes → CRITICAL
+- **Frequent state changes**: >10 changes per hour → WARNING
+- **High clock offsets**: >100ns deviation → WARNING
+
+#### ⚡ **Real-Time Response**
+With continuous monitoring enabled:
+- **Detection time**: Within 5 seconds of state change
+- **Alert delivery**: Immediate notification via Claude Desktop
+- **Event buffering**: Last 1000 events kept for analysis
+- **Alert history**: Maintains alert log with timestamps and recommendations
+
+#### 🎯 **Use Cases**
+- **Network troubleshooting**: Immediate notification of sync loss
+- **Performance monitoring**: Track clock quality degradation
+- **Recovery validation**: Confirm restoration of synchronization
+- **Trend analysis**: Historical pattern detection for proactive maintenance
+
 ## Code Conventions
 
 ### Error Handling

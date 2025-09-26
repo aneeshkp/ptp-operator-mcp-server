@@ -451,7 +451,19 @@ class PTPEventSubscriber:
         return runner
 
 class PTPDiagnosticAgent:
-    """AI-powered diagnostic agent for PTP events"""
+    """AI-powered diagnostic agent for PTP events
+
+    Provides immediate alerting on any PTP state changes:
+    - Real-time detection of FREERUN, HOLDOVER, FAULTY states
+    - Clock class change monitoring (6→7, 6→248, etc.)
+    - Recovery notifications for LOCKED state returns
+    - Pattern analysis for persistent issues and trends
+
+    Alert Severity Levels:
+    - CRITICAL: Sync loss (FREERUN), poor quality (class ≥248)
+    - WARNING: Temporary issues (HOLDOVER), state changes
+    - INFO: Recovery confirmations, normal state notifications
+    """
     
     def __init__(self):
         self.event_history: Dict[str, List[PTPEvent]] = {}  # node_name -> events
@@ -487,13 +499,98 @@ class PTPDiagnosticAgent:
             return datetime.fromisoformat(time_str.replace('Z', '+00:00'))
         except:
             return datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo)
+
+    def _parse_timestamp_with_timezone(self, timestamp_str: str) -> datetime:
+        """Parse timestamp ensuring timezone awareness"""
+        try:
+            # Handle ISO format timestamps
+            if 'T' in timestamp_str:
+                return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+            else:
+                # Assume naive timestamp, add local timezone
+                dt = datetime.fromisoformat(timestamp_str)
+                return dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        except:
+            return datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo)
     
     async def _diagnose_patterns(self, node_name: str, latest_event: PTPEvent) -> Optional[DiagnosticResult]:
-        """AI-powered pattern analysis"""
+        """AI-powered pattern analysis with immediate state change alerts
+
+        Alert Generation Strategy:
+
+        IMMEDIATE ALERTS (any state change):
+        - CRITICAL: FREERUN, FAULTY, clock class ≥248
+        - WARNING: HOLDOVER, clock class changes (6→7, 6→248)
+        - INFO: LOCKED recovery, clock class 6
+
+        PATTERN ALERTS (historical analysis):
+        - CRITICAL: Persistent FREERUN >5min
+        - WARNING: Frequent changes >10/hour, high offsets >100ns
+        """
         events = self.event_history[node_name]
+        if len(events) < 1:
+            return None
+
+        # Pattern 0: Immediate state change alerts (any state change)
+        if latest_event.data_type == 'notification':
+            # Alert on any PTP state change (LOCKED, FREERUN, HOLDOVER, etc.)
+            if latest_event.value in ['FREERUN', 'HOLDOVER', 'FAULTY']:
+                severity = 'CRITICAL' if latest_event.value == 'FREERUN' else 'WARNING'
+                return DiagnosticResult(
+                    severity=severity,
+                    summary=f'PTP state change: {node_name} → {latest_event.value}',
+                    details=f'Node transitioned to {latest_event.value} state. Resource: {latest_event.resource_address}',
+                    recommendations=[
+                        f'Monitor {latest_event.value} state duration',
+                        'Check PTP daemon logs for details',
+                        'Verify network connectivity to grandmaster',
+                        'Check hardware timestamping capability'
+                    ],
+                    affected_nodes=[node_name],
+                    timestamp=datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo).isoformat()
+                )
+            elif latest_event.value == 'LOCKED':
+                # Also alert when returning to LOCKED (recovery)
+                return DiagnosticResult(
+                    severity='INFO',
+                    summary=f'PTP state recovered: {node_name} → LOCKED',
+                    details=f'Node successfully returned to synchronized state. Resource: {latest_event.resource_address}',
+                    recommendations=[
+                        'PTP synchronization restored',
+                        'Monitor for stability'
+                    ],
+                    affected_nodes=[node_name],
+                    timestamp=datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo).isoformat()
+                )
+
+        # Pattern 0.5: Clock class changes (any change)
+        if latest_event.data_type == 'metric' and 'clock-class' in latest_event.resource_address:
+            try:
+                clock_class = int(float(latest_event.value))
+                severity = 'WARNING'
+                if clock_class == 6:
+                    severity = 'INFO'
+                elif clock_class >= 248:
+                    severity = 'CRITICAL'
+
+                return DiagnosticResult(
+                    severity=severity,
+                    summary=f'Clock class change: {node_name} → class {clock_class}',
+                    details=f'PTP clock class changed to {clock_class}. Lower values indicate better synchronization.',
+                    recommendations=[
+                        'Monitor clock class stability',
+                        'Class 6-8: Normal operation',
+                        'Class 248+: Poor or no synchronization'
+                    ],
+                    affected_nodes=[node_name],
+                    timestamp=datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo).isoformat()
+                )
+            except (ValueError, TypeError):
+                pass
+
         if len(events) < 2:
             return None
-            
+
         # Pattern 1: Persistent FREERUN state
         if latest_event.value == 'FREERUN':
             freerun_duration = self._calculate_freerun_duration(events)
@@ -509,7 +606,7 @@ class PTPDiagnosticAgent:
                         'Review ptp4l daemon logs for errors'
                     ],
                     affected_nodes=[node_name],
-                    timestamp=datetime.now().isoformat()
+                    timestamp=datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo).isoformat()
                 )
         
         # Pattern 2: Frequent state changes
@@ -545,7 +642,7 @@ class PTPDiagnosticAgent:
                             'Consider PTP servo tuning if persistent'
                         ],
                         affected_nodes=[node_name],
-                        timestamp=datetime.now().isoformat()
+                        timestamp=datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo).isoformat()
                     )
             except ValueError:
                 pass
@@ -626,12 +723,22 @@ class PTPAgenticService:
             """Get recent alerts for MCP server"""
             hours = int(request.query.get('hours', '24'))
             cutoff = datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo) - timedelta(hours=hours)
-            
+
+            def parse_timestamp_safe(timestamp_str):
+                try:
+                    if 'T' in timestamp_str:
+                        return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                    else:
+                        dt = datetime.fromisoformat(timestamp_str)
+                        return dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+                except:
+                    return datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo)
+
             recent_alerts = [
                 asdict(alert) for alert in self.alerts
-                if datetime.fromisoformat(alert.timestamp) > cutoff
+                if parse_timestamp_safe(alert.timestamp) > cutoff
             ]
-            
+
             return web.json_response(recent_alerts)
         
         async def get_event_summary(request):

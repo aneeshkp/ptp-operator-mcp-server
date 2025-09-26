@@ -178,6 +178,55 @@ echo '{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"get_agen
    - "Show me the PTP agent summary"
    - "Get critical alerts from the PTP agent"
 
+## Step 6.5: Enable Continuous Monitoring (Optional)
+
+### Start Real-Time Monitoring
+```bash
+# In Claude Desktop, ask:
+"Start PTP monitoring with 2-minute intervals"
+# or for faster alerting:
+"Start PTP monitoring with 30-second intervals and WARNING level alerts"
+```
+
+### Expected Alert Behavior
+
+The PTP agent now generates **immediate alerts** for any state changes:
+
+#### 🔴 **CRITICAL Alerts (Immediate Response)**
+- **FREERUN state**: Complete synchronization loss
+- **Clock class ≥248**: Poor/no synchronization
+- **FAULTY state**: Hardware issues
+
+#### 🟡 **WARNING Alerts (Immediate Response)**
+- **HOLDOVER state**: Temporary sync reference loss
+- **Clock class changes**: 6→7, 6→248, any deviation
+- **State transitions**: Any change from LOCKED
+
+#### 🔵 **INFO Alerts (Immediate Response)**
+- **LOCKED state**: Recovery notifications
+- **Clock class 6**: Return to optimal sync
+
+#### 📊 **Pattern Alerts (Historical Analysis)**
+- **Persistent issues**: FREERUN >5min, frequent changes >10/hour
+- **Performance degradation**: High offsets >100ns
+
+### Test Alert Generation
+```bash
+# Create a test state change (if possible in your environment)
+# Watch for immediate alerts in Claude Desktop
+
+# Check alert history
+curl http://localhost:8081/alerts?hours=1
+
+# Verify monitoring status in Claude Desktop
+"Get monitoring status"
+```
+
+### Monitoring Commands
+- **"Get monitoring status"** - Current monitoring state and alert count
+- **"Stop PTP monitoring"** - End continuous monitoring
+- **"Show recent alerts and history"** - Review alert timeline
+
 ## Step 7: Monitor and Troubleshoot
 
 ### Check Agent Subscriptions
