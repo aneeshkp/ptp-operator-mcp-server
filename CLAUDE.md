@@ -106,21 +106,86 @@ kubectl auth can-i create pods/exec -n openshift-ptp
 - Full in-cluster deployment possible if needed
 
 ### Claude Desktop Integration
-For the recommended local MCP server setup, add to Claude Desktop config:
+
+#### Configuration File Location
+`~/.config/claude-desktop/claude_desktop_config.json`
+
+#### Recommended Configuration (Local MCP + In-Cluster Agent)
 ```json
 {
   "mcpServers": {
     "ptp-operator": {
       "command": "node",
-      "args": ["/path/to/ptp-operator-mcp-server/index.js"],
+      "args": ["/home/aputtur/github.com/aneeshkp/ptp-operator-mcp-server/index.js"],
       "env": {
-        "KUBECONFIG": "/path/to/your/.kube/config",
-        "PTP_AGENT_URL": "http://ptp-agent.ptp-agent-system.svc.cluster.local:8081"
+        "KUBECONFIG": "/home/aputtur/.kube/config",
+        "PTP_AGENT_URL": "http://localhost:8081"
       }
     }
   }
 }
 ```
+
+**Important Configuration Notes:**
+- ✅ **MCP Server Name**: Must be exactly `"ptp-operator"` (not `"ptp-operator-mcp-server"`)
+- ✅ **PTP_AGENT_URL**: Use `"http://localhost:8081"` with port forwarding for local access
+- ✅ **JSON Syntax**: Ensure proper comma placement and valid JSON format
+
+#### Setup Steps:
+1. **Start Port Forwarding**:
+   ```bash
+   oc port-forward svc/ptp-agent 8081:8081 -n ptp-agent &
+   ```
+
+2. **Update Claude Desktop Config** with the configuration above
+
+3. **Restart Claude Desktop** completely (quit and reopen)
+
+4. **Verify Connection**:
+   ```bash
+   curl http://localhost:8081/health  # Should return "OK"
+   ```
+
+#### Alternative: Direct Cluster Access
+If you prefer direct cluster access without port forwarding:
+```json
+{
+  "mcpServers": {
+    "ptp-operator": {
+      "command": "node",
+      "args": ["/home/aputtur/github.com/aneeshkp/ptp-operator-mcp-server/index.js"],
+      "env": {
+        "KUBECONFIG": "/home/aputtur/.kube/config",
+        "PTP_AGENT_URL": "http://ptp-agent.ptp-agent.svc.cluster.local:8081"
+      }
+    }
+  }
+}
+```
+
+#### Troubleshooting
+
+**Common Issues:**
+
+1. **"Extension ptp-operator not found" Warning**
+   - This is safe to ignore - it's Claude Desktop checking for extensions vs MCP servers
+   - Your MCP server will still work correctly
+
+2. **"PTP agentic service is not running or accessible"**
+   - ✅ Check MCP server name is exactly `"ptp-operator"`
+   - ✅ Verify JSON syntax is valid (commas, brackets)
+   - ✅ Ensure port forwarding is running: `curl http://localhost:8081/health`
+   - ✅ Restart Claude Desktop after config changes
+
+3. **Tools Not Available**
+   - Check Claude Desktop logs for MCP server startup errors
+   - Verify the `index.js` file path is correct and absolute
+   - Test MCP server manually: `echo '{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}' | node index.js`
+
+**Verification Commands for Claude Desktop:**
+- "List available tools" - Should show PTP monitoring tools
+- "Get PTP agent summary" - Should return current PTP status
+- "Start PTP monitoring" - Should begin continuous monitoring
 
 ## Code Conventions
 

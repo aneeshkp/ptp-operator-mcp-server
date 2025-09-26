@@ -274,9 +274,42 @@ oc patch deployment ptp-agent -n ptp-agent -p '{
 - Test agent endpoints with curl
 
 ### Claude Desktop Issues
+
+#### Common Configuration Errors:
+1. **Wrong MCP Server Name**
+   ```json
+   // ❌ WRONG - Don't use this name
+   "ptp-operator-mcp-server": {
+
+   // ✅ CORRECT - Use exactly this name
+   "ptp-operator": {
+   ```
+
+2. **JSON Syntax Errors**
+   ```json
+   // ❌ WRONG - Missing comma
+   "env": {
+     "KUBECONFIG": "/path/to/config",
+     "PTP_AGENT_URL": "http://localhost:8081"
+   }    // Missing comma here!
+
+   // ✅ CORRECT - Proper syntax
+   "env": {
+     "KUBECONFIG": "/path/to/config",
+     "PTP_AGENT_URL": "http://localhost:8081"
+   }
+   ```
+
+3. **Agent Connection Issues**
+   - Verify port forwarding: `curl http://localhost:8081/health`
+   - Check if `PTP_AGENT_URL` environment variable is being used
+   - Test MCP server locally: `PTP_AGENT_URL=http://localhost:8081 node index.js`
+
+#### Troubleshooting Steps:
 - Restart Claude Desktop after config changes
 - Check Claude Desktop logs for MCP errors
 - Verify MCP server can start locally
+- Validate JSON syntax: `cat ~/.config/claude-desktop/claude_desktop_config.json | jq .`
 
 ### Performance Issues
 - Monitor agent memory/CPU usage
