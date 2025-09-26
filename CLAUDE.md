@@ -265,3 +265,4 @@ With continuous monitoring enabled:
 - Multiple transport methods supported: stdio (default) and HTTP
 - Python MCP server (`server.py`) is alternative implementation, agent (`ptp_agent.py`) is production component
 - to memorize
+- event model

@@ -50,13 +50,23 @@ class PTPEvent:
         values = data.get('values', [{}])
         first_value = values[0] if values else {}
         
-        # Extract node name from resource address
-        resource_addr = first_value.get('ResourceAddress', '')
+        # Extract node name from resource address (handle different formats)
+        resource_addr = first_value.get('ResourceAddress', first_value.get('resource', ''))
+
+        # Also try getting from event source if resource address is empty
+        if not resource_addr:
+            resource_addr = event_data.get('source', '')
+
         node_name = None
         if '/cluster/node/' in resource_addr:
             parts = resource_addr.split('/cluster/node/')
             if len(parts) > 1:
                 node_name = parts[1].split('/')[0]
+
+        # Handle different event formats
+        data_type = first_value.get('dataType', first_value.get('data_type', ''))
+        value_type = first_value.get('valueType', first_value.get('value_type', ''))
+        value = first_value.get('value', '')
         
         return cls(
             id=event_data.get('id', ''),
@@ -65,9 +75,9 @@ class PTPEvent:
             time=event_data.get('time', ''),
             data_version=data.get('version', ''),
             resource_address=resource_addr,
-            data_type=first_value.get('data_type', ''),
-            value_type=first_value.get('value_type', ''),
-            value=first_value.get('value', ''),
+            data_type=data_type,
+            value_type=value_type,
+            value=value,
             node_name=node_name
         )
 
@@ -468,10 +478,11 @@ class PTPDiagnosticAgent:
     def __init__(self):
         self.event_history: Dict[str, List[PTPEvent]] = {}  # node_name -> events
         self.alert_thresholds = {
-            'freerun_duration_minutes': 5,
+            'freerun_duration_minutes': 2,  # Reduced from 5 to 2 minutes
             'fault_count_threshold': 3,
             'offset_threshold': 100,
-            'state_change_frequency': 10  # changes per hour
+            'state_change_frequency': 30,  # Increased from 10 to 30 changes per hour
+            'min_freerun_duration_seconds': 10  # New: Only alert if FREERUN lasts >10 seconds
         }
         
     async def analyze_event(self, event: PTPEvent) -> Optional[DiagnosticResult]:
@@ -533,8 +544,75 @@ class PTPDiagnosticAgent:
 
         # Pattern 0: Immediate state change alerts (any state change)
         if latest_event.data_type == 'notification':
-            # Alert on any PTP state change (LOCKED, FREERUN, HOLDOVER, etc.)
-            if latest_event.value in ['FREERUN', 'HOLDOVER', 'FAULTY']:
+            # Pattern 0.1: GNSS/GPS state changes (CRITICAL for antenna issues)
+            if 'gnss' in latest_event.resource_address.lower() or 'gps' in latest_event.resource_address.lower():
+                if latest_event.value in ['ANTENNA-DISCONNECTED', 'ANTENNA-SHORT-CIRCUIT', 'NO-FIX', 'SURVEY-FAIL']:
+                    return DiagnosticResult(
+                        severity='CRITICAL',
+                        summary=f'GNSS/GPS issue: {node_name} → {latest_event.value}',
+                        details=f'GNSS/GPS hardware problem detected. Resource: {latest_event.resource_address}',
+                        recommendations=[
+                            'Check GNSS/GPS antenna connection',
+                            'Verify antenna cable integrity',
+                            'Check for physical antenna damage',
+                            'Ensure clear sky view for GPS reception',
+                            'Check GNSS module status'
+                        ],
+                        affected_nodes=[node_name],
+                        timestamp=datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo).isoformat()
+                    )
+                elif latest_event.value in ['LOCKED', 'TRACKING']:
+                    return DiagnosticResult(
+                        severity='INFO',
+                        summary=f'GNSS/GPS recovered: {node_name} → {latest_event.value}',
+                        details=f'GNSS/GPS synchronization restored. Resource: {latest_event.resource_address}',
+                        recommendations=[
+                            'GNSS/GPS tracking restored',
+                            'Monitor signal stability'
+                        ],
+                        affected_nodes=[node_name],
+                        timestamp=datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo).isoformat()
+                    )
+
+            # Pattern 0.2: OS Clock sync state changes
+            elif 'os-clock-sync-state' in latest_event.resource_address or 'CLOCK_REALTIME' in latest_event.resource_address:
+                if latest_event.value in ['FREERUN', 'HOLDOVER']:
+                    severity = 'CRITICAL' if latest_event.value == 'FREERUN' else 'WARNING'
+                    return DiagnosticResult(
+                        severity=severity,
+                        summary=f'OS Clock sync lost: {node_name} → {latest_event.value}',
+                        details=f'System clock synchronization issue. Resource: {latest_event.resource_address}',
+                        recommendations=[
+                            'Check system clock synchronization',
+                            'Verify PTP/NTP daemon status',
+                            'Check chrony/timesyncd configuration',
+                            'Monitor system clock drift'
+                        ],
+                        affected_nodes=[node_name],
+                        timestamp=datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo).isoformat()
+                    )
+                elif latest_event.value == 'LOCKED':
+                    return DiagnosticResult(
+                        severity='INFO',
+                        summary=f'OS Clock sync recovered: {node_name} → LOCKED',
+                        details=f'System clock synchronization restored. Resource: {latest_event.resource_address}',
+                        recommendations=[
+                            'OS clock synchronization restored',
+                            'Monitor clock stability'
+                        ],
+                        affected_nodes=[node_name],
+                        timestamp=datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo).isoformat()
+                    )
+
+            # Pattern 0.3: PTP state changes (with duration filtering for FREERUN)
+            elif latest_event.value in ['FREERUN', 'HOLDOVER', 'FAULTY']:
+                # For FREERUN, check if it's been persistent (not just a brief transition)
+                if latest_event.value == 'FREERUN':
+                    freerun_duration_seconds = self._calculate_freerun_duration_seconds(events)
+                    if freerun_duration_seconds < self.alert_thresholds['min_freerun_duration_seconds']:
+                        # Skip brief FREERUN states (likely normal servo adjustments)
+                        return None
+                
                 severity = 'CRITICAL' if latest_event.value == 'FREERUN' else 'WARNING'
                 return DiagnosticResult(
                     severity=severity,
@@ -650,7 +728,7 @@ class PTPDiagnosticAgent:
         return None
     
     def _calculate_freerun_duration(self, events: List[PTPEvent]) -> float:
-        """Calculate how long node has been in FREERUN state"""
+        """Calculate how long node has been in FREERUN state (in minutes)"""
         freerun_events = [e for e in events if e.value == 'FREERUN']
         if not freerun_events:
             return 0
@@ -658,6 +736,29 @@ class PTPDiagnosticAgent:
         first_freerun = min(freerun_events, key=lambda e: self._parse_event_time(e.time))
         duration = datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo) - self._parse_event_time(first_freerun.time)
         return duration.total_seconds() / 60
+
+    def _calculate_freerun_duration_seconds(self, events: List[PTPEvent]) -> float:
+        """Calculate how long node has been in FREERUN state (in seconds)"""
+        freerun_events = [e for e in events if e.value == 'FREERUN']
+        if not freerun_events:
+            return 0
+            
+        # Find the most recent continuous FREERUN period
+        recent_events = sorted(events, key=lambda e: self._parse_event_time(e.time))
+        
+        # Look for the start of the current FREERUN period (last non-FREERUN event)
+        freerun_start = None
+        for event in reversed(recent_events):
+            if event.value == 'FREERUN':
+                freerun_start = event
+            else:
+                break
+                
+        if not freerun_start:
+            return 0
+            
+        duration = datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo) - self._parse_event_time(freerun_start.time)
+        return duration.total_seconds()
     
     def _count_state_changes(self, events: List[PTPEvent]) -> int:
         """Count state changes in the last hour"""
@@ -722,17 +823,17 @@ class PTPAgenticService:
         async def get_recent_alerts(request):
             """Get recent alerts for MCP server"""
             hours = int(request.query.get('hours', '24'))
-            cutoff = datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo) - timedelta(hours=hours)
+            cutoff = datetime.now() - timedelta(hours=hours)
 
             def parse_timestamp_safe(timestamp_str):
                 try:
                     if 'T' in timestamp_str:
-                        return datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        dt = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        return dt.replace(tzinfo=None)  # Make naive for comparison
                     else:
-                        dt = datetime.fromisoformat(timestamp_str)
-                        return dt.replace(tzinfo=datetime.now().astimezone().tzinfo)
+                        return datetime.fromisoformat(timestamp_str)
                 except:
-                    return datetime.now().replace(tzinfo=datetime.now().astimezone().tzinfo)
+                    return datetime.now()
 
             recent_alerts = [
                 asdict(alert) for alert in self.alerts

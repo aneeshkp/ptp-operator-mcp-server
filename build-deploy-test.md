@@ -196,15 +196,20 @@ The PTP agent now generates **immediate alerts** for any state changes:
 - **FREERUN state**: Complete synchronization loss
 - **Clock class ≥248**: Poor/no synchronization
 - **FAULTY state**: Hardware issues
+- **GNSS/GPS Issues**: ANTENNA-DISCONNECTED, ANTENNA-SHORT-CIRCUIT, NO-FIX, SURVEY-FAIL
+- **OS Clock FREERUN**: System clock synchronization lost
 
 #### 🟡 **WARNING Alerts (Immediate Response)**
 - **HOLDOVER state**: Temporary sync reference loss
 - **Clock class changes**: 6→7, 6→248, any deviation
 - **State transitions**: Any change from LOCKED
+- **OS Clock HOLDOVER**: Temporary system clock sync loss
 
 #### 🔵 **INFO Alerts (Immediate Response)**
 - **LOCKED state**: Recovery notifications
 - **Clock class 6**: Return to optimal sync
+- **GNSS/GPS Recovery**: LOCKED, TRACKING states
+- **OS Clock Recovery**: System clock sync restored
 
 #### 📊 **Pattern Alerts (Historical Analysis)**
 - **Persistent issues**: FREERUN >5min, frequent changes >10/hour
@@ -226,6 +231,22 @@ curl http://localhost:8081/alerts?hours=1
 - **"Get monitoring status"** - Current monitoring state and alert count
 - **"Stop PTP monitoring"** - End continuous monitoring
 - **"Show recent alerts and history"** - Review alert timeline
+- **"Check the PTP alerts resource"** - Get immediate unread alerts (MCP resource notifications)
+- **"Show me ptp://alerts/current"** - Direct resource access for latest alerts
+
+### MCP Resource Notifications (NEW)
+The system now sends **automatic notifications** to Claude Desktop when new alerts occur:
+
+1. **Background monitoring** detects new PTP events
+2. **MCP resource notification** sent to Claude Desktop
+3. **User checks alerts**: "Check the PTP alerts resource"
+4. **Immediate response**: See all unread alerts with details
+
+**Benefits**:
+- ✅ Real-time notifications when alerts occur
+- ✅ Rich alert details with node, severity, recommendations
+- ✅ Unread tracking (only shows new alerts)
+- ✅ Complete alert history available
 
 ## Step 7: Monitor and Troubleshoot
 

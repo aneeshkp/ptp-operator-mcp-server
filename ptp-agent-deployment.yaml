@@ -123,13 +123,23 @@ subjects:
 - kind: ServiceAccount
   name: ptp-agent
   namespace: ptp-agent
-# ---
-# # Optional: Secret for Slack webhook (uncomment if you want Slack alerts)
-# apiVersion: v1
-# kind: Secret
-# metadata:
-#   name: ptp-agent-config
-#   namespace: ptp-agent
-# type: Opaque
-# stringData:
-#   slack-webhook-url: "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+---
+# External Route for stable access (no port forwarding needed)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ptp-agent
+  namespace: ptp-agent
+  labels:
+    app: ptp-agent
+spec:
+  to:
+    kind: Service
+    name: ptp-agent
+    weight: 100
+  port:
+    targetPort: mcp-integration
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
