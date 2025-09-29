@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ptp-agent
+  labels:
+    name: ptp-agent
+    app: ptp-agent
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ptp-agent
+  namespace: ptp-agent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ptp-agent
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list"]
+- apiGroups: ["ptp.openshift.io"]
+  resources: ["ptpconfigs", "nodeptpdevices"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ptp-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ptp-agent
+subjects:
+- kind: ServiceAccount
+  name: ptp-agent
+  namespace: ptp-agent

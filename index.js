@@ -12,10 +12,13 @@ import {
   CallToolRequestSchema,
   ErrorCode,
   ListToolsRequestSchema,
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import k8s from '@kubernetes/client-node';
 import { Writable } from 'stream';
+import { spawn } from 'child_process';
 
 class PTPOperatorMCPServer {
   constructor() {
@@ -27,6 +30,10 @@ class PTPOperatorMCPServer {
       {
         capabilities: {
           tools: {},
+          resources: {},
+          notifications: {
+            'resources/changed': {}
+          }
         },
       }
     );
@@ -36,7 +43,7 @@ class PTPOperatorMCPServer {
     try {
       this.kc.loadFromDefault();
     } catch (error) {
-      console.error('Failed to load kubeconfig:', error.message);
+      // Failed to load kubeconfig - continue without logging to avoid breaking MCP
     }
 
     this.k8sApi = this.kc.makeApiClient(k8s.CoreV1Api);
@@ -54,11 +61,40 @@ class PTPOperatorMCPServer {
       proxy: 'cloud-event-proxy'
     };
     this.ptpDaemonSetName = 'linuxptp-daemon';
+    
+    // Agentic service integration with auto port-forward
+    this.agentServiceUrl = process.env.PTP_AGENT_URL || 'http://localhost:8081';
+    this.agentNamespace = process.env.AGENT_NAMESPACE || 'ptp-agent';
+    this.portForwardProcess = null;
+    this.portForwardPort = 8081;
+
+    // Enhanced polling configuration
+    this.lastAlertCheck = null;
+    this.pollingEnabled = false;
+
+    // Monitoring state
+    this.monitoringState = {
+      active: false,
+      intervalId: null,
+      intervalSeconds: 10,
+      alertSeverity: 'WARNING',
+      maxAlerts: 50,
+      alertHistory: [],
+      lastCheck: null,
+      startTime: null
+    };
 
     this.setupHandlers();
+    this.setupAgentConnection();
   }
 
   setupHandlers() {
+    // Debug: Log server startup with timestamp
+    try {
+      const fs = require('fs');
+      fs.appendFileSync('/tmp/ptp-mcp-debug.log', `${new Date().toISOString()} - MCP SERVER HANDLERS SETUP - UPDATED CODE v3\n`);
+    } catch (e) {}
+
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
         {
@@ -391,9 +427,178 @@ class PTPOperatorMCPServer {
               }
             }
           }
+        },
+        {
+          name: 'get_agent_alerts',
+          description: 'Get real-time alerts from PTP agentic service',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              hours: {
+                type: 'number',
+                description: 'Hours of alert history to retrieve (default: 24)',
+                default: 24
+              },
+              severity: {
+                type: 'string',
+                description: 'Filter by severity level',
+                enum: ['INFO', 'WARNING', 'CRITICAL', 'all'],
+                default: 'all'
+              }
+            }
+          }
+        },
+        {
+          name: 'get_agent_summary',
+          description: 'Get real-time PTP event summary from agentic service',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              nodeName: {
+                type: 'string',
+                description: 'Specific node name (optional)'
+              }
+            }
+          }
+        },
+        {
+          name: 'start_ptp_monitoring',
+          description: 'Start continuous PTP monitoring with automatic alerts and summaries',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              intervalSeconds: {
+                type: 'number',
+                description: 'Check interval in seconds (default: 10, minimum: 5)',
+                default: 10
+              },
+              alertSeverity: {
+                type: 'string',
+                description: 'Minimum severity level to report',
+                enum: ['INFO', 'WARNING', 'CRITICAL', 'all'],
+                default: 'WARNING'
+              },
+              maxAlerts: {
+                type: 'number',
+                description: 'Maximum alerts to track (default: 50)',
+                default: 50
+              }
+            }
+          }
+        },
+        {
+          name: 'stop_ptp_monitoring',
+          description: 'Stop continuous PTP monitoring',
+          inputSchema: {
+            type: 'object',
+            properties: {}
+          }
+        },
+        {
+          name: 'get_monitoring_status',
+          description: 'Get current monitoring status and recent alerts',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              includeHistory: {
+                type: 'boolean',
+                description: 'Include alert history in response',
+                default: true
+              }
+            }
+          }
+        },
+        {
+          name: 'force_alert_check',
+          description: 'Immediately check for new alerts from the agent (useful for testing)',
+          inputSchema: {
+            type: 'object',
+            properties: {}
+          }
+        },
+        {
+          name: 'get_alert_notifications',
+          description: '🚨 Get immediate alert notifications - shows new alerts as they occur (use MCP resource ptp://alerts/current for auto-updates)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              markAsRead: {
+                type: 'boolean',
+                description: 'Mark notifications as read after displaying',
+                default: true
+              }
+            }
+          }
         }
       ]
     }));
+
+    // Resource handlers
+    this.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+      resources: [
+        {
+          uri: 'ptp://alerts/current',
+          name: 'Current PTP Alerts',
+          description: 'Real-time PTP alerts and notifications',
+          mimeType: 'application/json'
+        }
+      ]
+    }));
+
+    this.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+      const { uri } = request.params;
+      
+      if (uri === 'ptp://alerts/current') {
+        try {
+          // Get alerts from monitoring state (more reliable than file)
+          const pendingNotifications = this.monitoringState.pendingNotifications || [];
+          const unreadAlerts = pendingNotifications.filter(a => !a.displayed);
+          const recentAlerts = this.monitoringState.alertHistory.slice(-10);
+
+          const alertSummary = {
+            unreadCount: unreadAlerts.length,
+            totalHistory: this.monitoringState.alertHistory.length,
+            monitoringActive: this.monitoringState.active,
+            lastCheck: this.monitoringState.lastCheck,
+            unreadAlerts: unreadAlerts.map(alert => ({
+              severity: alert.severity,
+              summary: alert.summary,
+              node: alert.affected_nodes?.[0] || 'unknown',
+              timestamp: alert.timestamp,
+              notifiedAt: alert.notifiedAt
+            })),
+            recentHistory: recentAlerts.map(alert => ({
+              severity: alert.severity,
+              summary: alert.summary,
+              timestamp: alert.timestamp
+            })),
+            lastUpdated: new Date().toISOString()
+          };
+
+          return {
+            contents: [
+              {
+                uri: uri,
+                mimeType: 'application/json',
+                text: JSON.stringify(alertSummary, null, 2)
+              }
+            ]
+          };
+        } catch (error) {
+          return {
+            contents: [
+              {
+                uri: uri,
+                mimeType: 'application/json',
+                text: JSON.stringify({ error: error.message }, null, 2)
+              }
+            ]
+          };
+        }
+      }
+      
+      throw new McpError(ErrorCode.InvalidRequest, `Unknown resource: ${uri}`);
+    });
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
@@ -426,11 +631,25 @@ class PTPOperatorMCPServer {
             return await this.diagnosePTPIssues(args);
           case 'get_cloud_events':
             return await this.getCloudEvents(args);
+          case 'get_agent_alerts':
+            return await this.getAgentAlerts(args);
+          case 'get_agent_summary':
+            return await this.getAgentSummary(args);
+          case 'start_ptp_monitoring':
+            return await this.startPTPMonitoring(args);
+          case 'stop_ptp_monitoring':
+            return await this.stopPTPMonitoring(args);
+          case 'get_monitoring_status':
+            return await this.getMonitoringStatus(args);
+          case 'force_alert_check':
+            return await this.forceAlertCheck(args);
+          case 'get_alert_notifications':
+            return await this.getAlertNotifications(args);
           default:
             throw new McpError(ErrorCode.MethodNotFound, `Tool ${name} not found`);
         }
       } catch (error) {
-        console.error(`Error executing tool ${name}:`, error);
+        // Error logged to stderr to avoid breaking MCP protocol
         throw new McpError(ErrorCode.InternalError, `Failed to execute ${name}: ${error.message}`);
       }
     });
@@ -591,6 +810,7 @@ class PTPOperatorMCPServer {
         namespace,
         this.ptpContainers.daemon,
         undefined, // follow
+        undefined, // insecureSkipTLSVerifyBackend
         undefined, // limitBytes
         undefined, // pretty
         undefined, // previous
@@ -645,8 +865,14 @@ class PTPOperatorMCPServer {
         targetPodName,
         namespace,
         this.ptpContainers.proxy,
-        undefined, undefined, undefined, undefined, 
-        undefined, tailLines, true
+        undefined, // follow
+        undefined, // insecureSkipTLSVerifyBackend
+        undefined, // limitBytes
+        undefined, // pretty
+        undefined, // previous
+        undefined, // sinceSeconds
+        tailLines,
+        true // timestamps
       );
 
       let logs = response.body;
@@ -688,8 +914,14 @@ class PTPOperatorMCPServer {
         targetPodName,
         namespace,
         this.ptpContainers.daemon,
-        undefined, undefined, undefined, undefined,
-        sinceSeconds, 1000, true
+        undefined, // follow
+        undefined, // insecureSkipTLSVerifyBackend
+        undefined, // limitBytes
+        undefined, // pretty
+        undefined, // previous
+        sinceSeconds,
+        1000, // tailLines
+        true // timestamps
       );
 
       const logs = response.body;
@@ -780,9 +1012,14 @@ class PTPOperatorMCPServer {
               pod.metadata.name,
               namespace,
               this.ptpContainers.daemon,
-              undefined, undefined, undefined, undefined,
-              300, // last 5 minutes
-              50, true
+              undefined, // follow
+              undefined, // insecureSkipTLSVerifyBackend
+              undefined, // limitBytes
+              undefined, // pretty
+              undefined, // previous
+              300, // sinceSeconds (last 5 minutes)
+              50, // tailLines
+              true // timestamps
             );
             
             podStatus.logSummary = this.analyzePTPLogContent(daemonLogs.body);
@@ -863,8 +1100,14 @@ class PTPOperatorMCPServer {
             pod,
             namespace,
             this.ptpContainers.proxy,
-            undefined, undefined, undefined, undefined,
-            sinceSeconds, 3000, true
+            undefined, // follow
+            undefined, // insecureSkipTLSVerifyBackend
+            undefined, // limitBytes
+            undefined, // pretty
+            undefined, // previous
+            sinceSeconds,
+            3000, // tailLines
+            true // timestamps
           );
           combinedLogs += (resp.body || '') + '\n';
         } catch (_) {}
@@ -1180,6 +1423,95 @@ class PTPOperatorMCPServer {
     };
   }
 
+  // Agentic service integration methods
+  async getAgentAlerts(args) {
+    const { hours = 24, severity = 'all' } = args;
+    
+    try {
+      // Handle self-signed certificates for HTTPS
+      if (this.agentServiceUrl.startsWith('https://')) {
+        process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0";
+      }
+
+      const fetchOptions = {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 10000
+      };
+      
+      const response = await fetch(`${this.agentServiceUrl}/alerts?hours=${hours}`, fetchOptions);
+      
+      if (!response.ok) {
+        throw new Error(`Agent service responded with ${response.status}`);
+      }
+      
+      const alerts = await response.json();
+      const filtered = severity === 'all' ? alerts : alerts.filter(a => a.severity === severity.toUpperCase());
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `PTP Agent Alerts (${filtered.length} alerts in last ${hours}h):\n\n${JSON.stringify(filtered, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Failed to connect to PTP agent service: ${error.message}\n\nEnsure the PTP agentic service is running and accessible at ${this.agentServiceUrl}`,
+          },
+        ],
+      };
+    }
+  }
+
+  async getAgentSummary(args) {
+    const { nodeName } = args;
+    
+    try {
+      // Handle self-signed certificates for HTTPS
+      if (this.agentServiceUrl.startsWith('https://')) {
+        process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0";
+      }
+
+      const fetchOptions = {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 10000
+      };
+      
+      const response = await fetch(`${this.agentServiceUrl}/summary`, fetchOptions);
+      
+      if (!response.ok) {
+        throw new Error(`Agent service responded with ${response.status}`);
+      }
+      
+      const summary = await response.json();
+      const filtered = nodeName ? { [nodeName]: summary[nodeName] } : summary;
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `PTP Agent Event Summary:\n\n${JSON.stringify(filtered, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Failed to connect to PTP agent service: ${error.message}\n\nEnsure the PTP agentic service is running and accessible at ${this.agentServiceUrl}`,
+          },
+        ],
+      };
+    }
+  }
+
   isPodReady(pod) {
     const conditions = pod.status?.conditions || [];
     return conditions.some(c => c.type === 'Ready' && c.status === 'True');
@@ -1348,8 +1680,632 @@ class PTPOperatorMCPServer {
     }
     return JSON.stringify(summary, null, 2);
   }
+
+  // Continuous monitoring methods
+  async startPTPMonitoring(args) {
+    const { intervalSeconds = 10, alertSeverity = 'WARNING', maxAlerts = 50 } = args;
+    
+    // Enforce minimum interval for stability
+    const actualInterval = Math.max(5, intervalSeconds);
+
+    if (this.monitoringState.active) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `PTP monitoring is already active. Started at ${this.monitoringState.startTime}, checking every ${this.monitoringState.intervalSeconds} seconds.`
+          }
+        ]
+      };
+    }
+
+    this.monitoringState = {
+      active: true,
+      intervalSeconds: actualInterval,
+      alertSeverity,
+      maxAlerts,
+      alertHistory: [],
+      lastCheck: new Date().toISOString(),
+      startTime: new Date().toISOString(),
+      intervalId: null
+    };
+
+    // Start monitoring loop
+    this.monitoringState.intervalId = setInterval(async () => {
+      await this.performMonitoringCheck();
+    }, actualInterval * 1000);
+
+    // Perform initial check
+    await this.performMonitoringCheck();
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `STARTING: PTP Continuous Monitoring Started!
+
+STATUS: Settings:
+- Check interval: ${actualInterval} seconds (${(actualInterval/60).toFixed(1)} minutes)
+- Alert severity: ${alertSeverity}+
+- Max alerts tracked: ${maxAlerts}
+- Started: ${this.monitoringState.startTime}
+
+SUCCESS: Initial check completed. Claude will now automatically monitor PTP events and alert you of issues.
+
+Use 'get_monitoring_status' to check current status or 'stop_ptp_monitoring' to stop.`
+        }
+      ]
+    };
+  }
+
+  async stopPTPMonitoring(args) {
+    if (!this.monitoringState.active) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'PTP monitoring is not currently active.'
+          }
+        ]
+      };
+    }
+
+    if (this.monitoringState.intervalId) {
+      clearInterval(this.monitoringState.intervalId);
+    }
+
+    const duration = new Date() - new Date(this.monitoringState.startTime);
+    const hours = Math.floor(duration / (1000 * 60 * 60));
+    const minutes = Math.floor((duration % (1000 * 60 * 60)) / (1000 * 60));
+
+    const finalStats = {
+      duration: `${hours}h ${minutes}m`,
+      totalAlerts: this.monitoringState.alertHistory.length,
+      criticalAlerts: this.monitoringState.alertHistory.filter(a => a.severity === 'CRITICAL').length,
+      warningAlerts: this.monitoringState.alertHistory.filter(a => a.severity === 'WARNING').length
+    };
+
+    this.monitoringState.active = false;
+    this.monitoringState.intervalId = null;
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `STOPPED: PTP Monitoring Stopped
+
+STATUS: Session Summary:
+- Duration: ${finalStats.duration}
+- Total alerts: ${finalStats.totalAlerts}
+- Critical alerts: ${finalStats.criticalAlerts}
+- Warning alerts: ${finalStats.warningAlerts}
+
+Alert history preserved. Use 'get_monitoring_status' to review.`
+        }
+      ]
+    };
+  }
+
+  async forceAlertCheck(args) {
+    if (!this.monitoringState.active) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'Monitoring is not active. Start monitoring first with "start_ptp_monitoring"'
+          }
+        ]
+      };
+    }
+
+    // Force alert check requested
+    await this.performMonitoringCheck();
+
+    const recentAlerts = this.monitoringState.alertHistory.slice(-10);
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `FORCE: Force Alert Check Complete\n\nRecent alerts found: ${recentAlerts.length}\n\n${JSON.stringify(recentAlerts, null, 2)}`
+        }
+      ]
+    };
+  }
+
+  async getAlertNotifications(args) {
+    const { markAsRead = true } = args;
+
+    try {
+      // Get notifications from memory (faster and more reliable)
+      const notifications = this.monitoringState.pendingNotifications || [];
+      const unreadNotifications = notifications.filter(n => !n.displayed);
+
+      if (unreadNotifications.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: '✅ No new alert notifications\n\nAll alerts have been reviewed. Use "force_alert_check" to check for new alerts.'
+            }
+          ]
+        };
+      }
+
+      let notificationText = `🚨 NEW PTP ALERT NOTIFICATIONS (${unreadNotifications.length})\n\n`;
+
+      unreadNotifications.forEach((notification, index) => {
+        const severity = notification.severity;
+        const emoji = severity === 'CRITICAL' ? '🔴' : severity === 'WARNING' ? '🟡' : '🟢';
+        
+        notificationText += `${emoji} ALERT ${index + 1}/${unreadNotifications.length}\n`;
+        notificationText += `Severity: ${severity}\n`;
+        notificationText += `Summary: ${notification.summary}\n`;
+        notificationText += `Node: ${notification.affected_nodes?.join(', ') || 'unknown'}\n`;
+        notificationText += `Time: ${new Date(notification.timestamp).toLocaleString()}\n`;
+        
+        if (notification.details) {
+          notificationText += `Details: ${notification.details}\n`;
+        }
+        
+        if (notification.recommendations && notification.recommendations.length > 0) {
+          notificationText += `Recommendations:\n`;
+          notification.recommendations.forEach(rec => {
+            notificationText += `  • ${rec}\n`;
+          });
+        }
+        
+        notificationText += `\n${'─'.repeat(60)}\n\n`;
+      });
+
+      // Mark as read if requested
+      if (markAsRead) {
+        this.monitoringState.pendingNotifications.forEach(n => {
+          if (!n.displayed) n.displayed = true;
+        });
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: notificationText
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error reading alert notifications: ${error.message}`
+          }
+        ]
+      };
+    }
+  }
+
+  async getMonitoringStatus(args) {
+    const { includeHistory = true } = args;
+
+    const status = {
+      active: this.monitoringState.active,
+      startTime: this.monitoringState.startTime,
+      lastCheck: this.monitoringState.lastCheck,
+      polling: {
+        lastCheck: this.monitoringState.lastCheck,
+        agentUrl: this.agentServiceUrl
+      },
+      settings: {
+        intervalSeconds: this.monitoringState.intervalSeconds,
+        alertSeverity: this.monitoringState.alertSeverity,
+        maxAlerts: this.monitoringState.maxAlerts
+      },
+      stats: {
+        totalAlerts: this.monitoringState.alertHistory.length,
+        criticalAlerts: this.monitoringState.alertHistory.filter(a => a.severity === 'CRITICAL').length,
+        warningAlerts: this.monitoringState.alertHistory.filter(a => a.severity === 'WARNING').length,
+        recentAlerts: this.monitoringState.alertHistory.slice(-5),
+        alertsInLastHour: this.monitoringState.alertHistory.filter(a => {
+          const alertTime = new Date(a.timestamp);
+          const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+          return alertTime > oneHourAgo;
+        }).length
+      }
+    };
+
+    if (includeHistory) {
+      status.alertHistory = this.monitoringState.alertHistory;
+    }
+
+    let statusText = `STATUS: PTP Monitoring Status
+
+Active: ${status.active ? 'YES' : 'NO'}
+ Agent URL: ${status.polling.agentUrl}`;
+
+    if (status.active) {
+      statusText += `
+ Started: ${status.startTime}
+FORCE: Last Check: ${status.lastCheck}
+ Check Interval: ${status.settings.intervalSeconds} seconds (${(status.settings.intervalSeconds/60).toFixed(1)} min)
+ALERT: Alert Level: ${status.settings.alertSeverity}+
+
+ Alert Statistics:
+- Total: ${status.stats.totalAlerts}
+- Critical: ${status.stats.criticalAlerts} 
+- Warning: ${status.stats.warningAlerts} 
+- Last hour: ${status.stats.alertsInLastHour} `;
+
+      if (status.stats.recentAlerts.length > 0) {
+        statusText += `\n\n Recent Alerts (last 5):`;
+        status.stats.recentAlerts.forEach(alert => {
+          const emoji = alert.severity === 'CRITICAL' ? '' : '';
+          statusText += `\n${emoji} [${alert.timestamp}] ${alert.summary}`;
+        });
+      }
+    }
+
+    if (includeHistory && status.alertHistory.length > 0) {
+      statusText += `\n\n Full Alert History:\n${JSON.stringify(status.alertHistory, null, 2)}`;
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: statusText
+        }
+      ]
+    };
+  }
+
+  async performMonitoringCheck() {
+    try {
+      this.monitoringState.lastCheck = new Date().toISOString();
+
+      // Debug logging to file (safe for MCP protocol)
+      const fs = await import('fs');
+      const debugLog = (msg) => {
+        try {
+          fs.appendFileSync('/tmp/ptp-mcp-debug.log', `${new Date().toISOString()} - ${msg}\n`);
+        } catch (e) {
+          // Ignore file write errors
+        }
+      };
+
+      debugLog(`Starting monitoring check - URL: ${this.agentServiceUrl}`);
+
+      // Handle self-signed certificates for HTTPS
+      if (this.agentServiceUrl.startsWith('https://')) {
+        process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0";
+      }
+
+      // Get alerts from last hour but filter for recent ones in processing
+      const alertsResponse = await fetch(`${this.agentServiceUrl}/alerts?hours=1`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 10000
+      });
+
+      debugLog(`Fetch response status: ${alertsResponse.status}`);
+
+      if (!alertsResponse.ok) {
+        debugLog(`Agent monitoring check failed: HTTP ${alertsResponse.status}`);
+        return;
+      }
+
+      const alerts = await alertsResponse.json();
+      debugLog(`Retrieved ${alerts.length} alerts from agent`);
+
+      // Get only ACTIVE ISSUES (exclude LOCKED/recovered states)
+      const activeIssues = new Map();
+      
+      // Sort alerts by timestamp (newest first)
+      const sortedAlerts = alerts.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+      
+      // For each resource, find the latest state and only keep if it's problematic
+      const resourceStates = new Map();
+      
+      sortedAlerts.forEach(alert => {
+        const resourceKey = alert.details?.match(/Resource: ([^\s]+)/)?.[1] || 'unknown';
+        
+        // Track the latest state for each resource
+        if (!resourceStates.has(resourceKey)) {
+          resourceStates.set(resourceKey, alert);
+        }
+      });
+      
+      // Keep alerts for both problematic states AND recovery notifications
+      resourceStates.forEach((latestAlert, resourceKey) => {
+        // Check if the latest state is either problematic OR a recovery notification
+        const isProblematic = latestAlert.summary.includes('→ FREERUN') ||
+                              latestAlert.summary.includes('→ HOLDOVER') ||
+                              latestAlert.summary.includes('→ FAULTY') ||
+                              latestAlert.summary.includes('Frequent PTP state changes');
+
+        // Clock class handling - include all clock class changes (they show quality)
+        const isClockClass = latestAlert.summary.includes('Clock class');
+
+        // Also include LOCKED recovery notifications (INFO severity)
+        const isRecovery = latestAlert.summary.includes('→ LOCKED') ||
+                          latestAlert.summary.includes('recovered');
+
+        if (isProblematic || isClockClass || isRecovery) {
+          activeIssues.set(resourceKey, latestAlert);
+        }
+      });
+      
+      // Convert back to array and filter by severity
+      const filteredAlerts = Array.from(activeIssues.values()).filter(alert => {
+        if (this.monitoringState.alertSeverity === 'all') return true;
+        if (this.monitoringState.alertSeverity === 'CRITICAL') return alert.severity === 'CRITICAL';
+        if (this.monitoringState.alertSeverity === 'WARNING') return ['WARNING', 'CRITICAL'].includes(alert.severity);
+        return true;
+      });
+
+      debugLog(`Filtered to ${filteredAlerts.length} alerts matching severity ${this.monitoringState.alertSeverity}`);
+
+      // Find genuinely new alerts using better timestamp comparison
+      const existingAlertKeys = new Set(
+        this.monitoringState.alertHistory.map(a => `${a.timestamp}:${a.summary}:${a.severity}`)
+      );
+
+      const newAlerts = filteredAlerts.filter(alert => {
+        const key = `${alert.timestamp}:${alert.summary}:${alert.severity}`;
+        return !existingAlertKeys.has(key);
+      });
+
+      debugLog(`Found ${newAlerts.length} new alerts (existing: ${this.monitoringState.alertHistory.length})`);
+
+      // Add new alerts to history and notify client
+      for (const alert of newAlerts) {
+        this.monitoringState.alertHistory.push({
+          ...alert,
+          detectedAt: new Date().toISOString()
+        });
+
+        debugLog(`NEW ALERT: ${alert.severity} - ${alert.summary}`);
+
+        // Store alert in monitoring state for immediate retrieval
+        this.monitoringState.pendingNotifications = this.monitoringState.pendingNotifications || [];
+        this.monitoringState.pendingNotifications.push({
+          ...alert,
+          notifiedAt: new Date().toISOString(),
+          displayed: false
+        });
+
+        // Keep only last 20 notifications
+        if (this.monitoringState.pendingNotifications.length > 20) {
+          this.monitoringState.pendingNotifications = this.monitoringState.pendingNotifications.slice(-20);
+        }
+
+        debugLog(`ALERT STORED IN MEMORY: ${alert.severity} - ${alert.summary}`);
+
+        // Send MCP resource change notification for new alerts
+        this.sendResourceChangeNotification();
+        debugLog(`SENT MCP RESOURCE NOTIFICATION FOR NEW ALERT`);
+      }
+
+      // Trim history if needed
+      if (this.monitoringState.alertHistory.length > this.monitoringState.maxAlerts) {
+        this.monitoringState.alertHistory = this.monitoringState.alertHistory.slice(-this.monitoringState.maxAlerts);
+      }
+
+      debugLog(`Monitoring check complete. Total alerts in history: ${this.monitoringState.alertHistory.length}`);
+
+    } catch (error) {
+      // Debug logging to file (safe for MCP protocol)
+      try {
+        const fs = await import('fs');
+        fs.appendFileSync('/tmp/ptp-mcp-debug.log', `${new Date().toISOString()} - ERROR: ${error.message}\n`);
+      } catch (e) {
+        // Ignore file write errors
+      }
+    }
+  }
+
+  async notifyClient(alert) {
+    try {
+      // Send alert notification via MCP resource change
+      const alertMessage = this.formatAlertForLLM(alert);
+      this.sendAlertToNotificationFile(alertMessage);
+      
+      // Log to debug file
+      const fs = await import('fs');
+      fs.appendFileSync('/tmp/ptp-mcp-debug.log', `${new Date().toISOString()} - ALERT SENT VIA MCP: ${alert.severity} - ${alert.summary}\n`);
+    } catch (error) {
+      // Log error to debug file only
+      try {
+        const fs = await import('fs');
+        fs.appendFileSync('/tmp/ptp-mcp-debug.log', `${new Date().toISOString()} - NOTIFICATION ERROR: ${error.message}\n`);
+      } catch (e) {
+        // Ignore file write errors
+      }
+    }
+  }
+
+  formatAlertForLLM(alert) {
+    const emoji = alert.severity === 'CRITICAL' ? '🔴' : alert.severity === 'WARNING' ? '🟡' : '🟢';
+    const timestamp = new Date(alert.timestamp).toLocaleString();
+    
+    let message = `${emoji} **PTP ALERT - ${alert.severity}**\n\n`;
+    message += `**Summary:** ${alert.summary}\n`;
+    message += `**Node:** ${alert.affected_nodes?.join(', ') || 'unknown'}\n`;
+    message += `**Time:** ${timestamp}\n`;
+    
+    if (alert.details) {
+      message += `**Details:** ${alert.details}\n`;
+    }
+    
+    if (alert.recommendations && alert.recommendations.length > 0) {
+      message += `**Recommendations:**\n`;
+      alert.recommendations.forEach(rec => {
+        message += `• ${rec}\n`;
+      });
+    }
+    
+    return message;
+  }
+
+  sendAlertToNotificationFile(message) {
+    try {
+      // Write alert to a notification file
+      const fs = require('fs');
+      const alertFile = '/tmp/ptp-alerts.json';
+      
+      // Debug log entry
+      fs.appendFileSync('/tmp/ptp-mcp-debug.log', `${new Date().toISOString()} - WRITING ALERT TO FILE: ${alertFile}\n`);
+      
+      const alertNotification = {
+        timestamp: new Date().toISOString(),
+        message: message,
+        processed: false
+      };
+      
+      // Append to alerts file
+      let alerts = [];
+      try {
+        const existingData = fs.readFileSync(alertFile, 'utf8');
+        alerts = JSON.parse(existingData);
+        fs.appendFileSync('/tmp/ptp-mcp-debug.log', `${new Date().toISOString()} - READ EXISTING ALERTS: ${alerts.length}\n`);
+      } catch (e) {
+        // File doesn't exist or is invalid, start fresh
+        alerts = [];
+        fs.appendFileSync('/tmp/ptp-mcp-debug.log', `${new Date().toISOString()} - STARTING FRESH ALERTS ARRAY\n`);
+      }
+      
+      alerts.push(alertNotification);
+      
+      // Keep only last 50 alerts
+      if (alerts.length > 50) {
+        alerts = alerts.slice(-50);
+      }
+      
+      fs.writeFileSync(alertFile, JSON.stringify(alerts, null, 2));
+      fs.appendFileSync('/tmp/ptp-mcp-debug.log', `${new Date().toISOString()} - WROTE ${alerts.length} ALERTS TO FILE\n`);
+      
+      // Send MCP resource change notification
+      this.sendResourceChangeNotification();
+      
+    } catch (error) {
+      // Log error to debug file only
+      try {
+        const fs = require('fs');
+        fs.appendFileSync('/tmp/ptp-mcp-debug.log', `${new Date().toISOString()} - FILE WRITE ERROR: ${error.message}\n${error.stack}\n`);
+      } catch (e) {
+        // Ignore file write errors
+      }
+    }
+  }
+
+  sendResourceChangeNotification() {
+    try {
+      // Send MCP resource change notification
+      this.server.notification({
+        method: 'notifications/resources/changed',
+        params: {
+          resources: ['ptp://alerts/current']
+        }
+      });
+      
+      // Log to debug file
+      const fs = require('fs');
+      fs.appendFileSync('/tmp/ptp-mcp-debug.log', `${new Date().toISOString()} - MCP RESOURCE NOTIFICATION SENT\n`);
+    } catch (error) {
+      // Log error to debug file only
+      try {
+        const fs = require('fs');
+        fs.appendFileSync('/tmp/ptp-mcp-debug.log', `${new Date().toISOString()} - MCP NOTIFICATION ERROR: ${error.message}\n`);
+      } catch (e) {
+        // Ignore file write errors
+      }
+    }
+  }
+
+  async setupAgentConnection() {
+    // Auto-setup port forward if using localhost and not explicitly disabled
+    if (this.agentServiceUrl.includes('localhost') && !process.env.DISABLE_AUTO_PORT_FORWARD) {
+      await this.ensurePortForward();
+    }
+  }
+
+  async ensurePortForward() {
+    try {
+      // Check if port forward is needed and not already running
+      if (this.portForwardProcess && !this.portForwardProcess.killed) {
+        return; // Already running
+      }
+
+      // Test if agent is already accessible
+      try {
+        const testResponse = await fetch(`${this.agentServiceUrl}/health`, { 
+          method: 'GET', 
+          timeout: 2000 
+        });
+        if (testResponse.ok) {
+          return; // Agent already accessible, no port forward needed
+        }
+      } catch (e) {
+        // Agent not accessible, need port forward
+      }
+
+      // Start port forward
+      const kubeconfigFlag = process.env.KUBECONFIG ? `--kubeconfig=${process.env.KUBECONFIG}` : '';
+      const cmd = kubeconfigFlag ? 
+        ['oc', kubeconfigFlag, 'port-forward', `svc/ptp-agent`, `${this.portForwardPort}:8081`, '-n', this.agentNamespace] :
+        ['oc', 'port-forward', `svc/ptp-agent`, `${this.portForwardPort}:8081`, '-n', this.agentNamespace];
+
+      this.portForwardProcess = spawn(cmd[0], cmd.slice(1), {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: false
+      });
+
+      // Wait a moment for port forward to establish
+      await new Promise(resolve => setTimeout(resolve, 3000));
+
+      // Test the connection
+      try {
+        const testResponse = await fetch(`${this.agentServiceUrl}/health`, { 
+          method: 'GET', 
+          timeout: 3000 
+        });
+        if (testResponse.ok) {
+          // Port forward successful
+        }
+      } catch (e) {
+        // Port forward might have failed, but continue anyway
+      }
+
+    } catch (error) {
+      // Port forward failed, but continue with direct service URL
+    }
+  }
+
+  cleanup() {
+    if (this.portForwardProcess && !this.portForwardProcess.killed) {
+      this.portForwardProcess.kill();
+    }
+  }
 }
 
-const serverInstance = new PTPOperatorMCPServer();
-const transport = new StdioServerTransport();
-serverInstance.server.connect(transport);
+// Export the class for reuse in other modules
+export { PTPOperatorMCPServer };
+
+// Only start stdio server if this is the main module
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const serverInstance = new PTPOperatorMCPServer();
+  const transport = new StdioServerTransport();
+  
+  // Cleanup on exit
+  process.on('SIGINT', () => {
+    serverInstance.cleanup();
+    process.exit(0);
+  });
+  
+  process.on('SIGTERM', () => {
+    serverInstance.cleanup();
+    process.exit(0);
+  });
+  
+  serverInstance.server.connect(transport);
+}

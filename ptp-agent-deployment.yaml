@@ -1,0 +1,145 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ptp-agent
+  labels:
+    name: ptp-agent
+    openshift.io/cluster-monitoring: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ptp-agent
+  namespace: ptp-agent
+  labels:
+    app: ptp-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ptp-agent
+  template:
+    metadata:
+      labels:
+        app: ptp-agent
+    spec:
+      serviceAccountName: ptp-agent
+      containers:
+      - name: ptp-agent
+        image: quay.io/aneeshkp/ptp-agent:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: consumer
+        - containerPort: 8081
+          name: mcp-integration
+        env:
+        - name: PTP_NAMESPACE
+          value: "openshift-ptp"
+        - name: AGENT_NAMESPACE
+          value: "ptp-agent"
+        - name: MCP_INTEGRATION_PORT
+          value: "8081"
+        # Slack webhook for alerts (optional)
+        # - name: SLACK_WEBHOOK_URL
+        #   valueFrom:
+        #     secretKeyRef:
+        #       name: ptp-agent-config
+        #       key: slack-webhook-url
+        #       optional: true
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptp-agent
+  namespace: ptp-agent
+  labels:
+    app: ptp-agent
+  # No special annotations needed for hostNetwork compatibility
+spec:
+  selector:
+    app: ptp-agent
+  ports:
+  - name: consumer
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  - name: mcp-integration
+    port: 8081
+    targetPort: 8081
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ptp-agent
+  namespace: ptp-agent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ptp-agent
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ptp-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ptp-agent
+subjects:
+- kind: ServiceAccount
+  name: ptp-agent
+  namespace: ptp-agent
+---
+# External Route for stable access (no port forwarding needed)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ptp-agent
+  namespace: ptp-agent
+  labels:
+    app: ptp-agent
+spec:
+  to:
+    kind: Service
+    name: ptp-agent
+    weight: 100
+  port:
+    targetPort: mcp-integration
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None

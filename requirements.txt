@@ -1,4 +1,5 @@
- mcp
- kubernetes
- pyyaml
-
+mcp
+kubernetes
+pyyaml
+aiohttp
+asyncio

@@ -1,0 +1,18 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: ptp-agent
+  namespace: ptp-agent
+  labels:
+    app: ptp-agent
+spec:
+  to:
+    kind: Service
+    name: ptp-agent
+    weight: 100
+  port:
+    targetPort: mcp-integration
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
