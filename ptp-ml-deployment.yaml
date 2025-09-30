@@ -1,0 +1,210 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ptp-ml
+  labels:
+    name: ptp-ml
+    openshift.io/cluster-monitoring: "false"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ptp-inference-service
+  namespace: ptp-ml
+  labels:
+    app: ptp-inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ptp-inference
+  template:
+    metadata:
+      labels:
+        app: ptp-inference
+    spec:
+      serviceAccountName: ptp-ml-service
+      containers:
+      - name: ptp-inference
+        image: quay.io/aneeshkp/ptp-inference:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8082
+          name: inference-api
+        env:
+        - name: PTP_MODEL_PATH
+          value: "/app/models/ptp_model.onnx"
+        - name: INFERENCE_PORT
+          value: "8082"
+        - name: LOG_LEVEL
+          value: "INFO"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        volumeMounts:
+        - name: model-storage
+          mountPath: /app/models
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8082
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8082
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 2
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: ptp-model-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ptp-inference-service
+  namespace: ptp-ml
+  labels:
+    app: ptp-inference
+spec:
+  selector:
+    app: ptp-inference
+  ports:
+  - name: inference-api
+    port: 8082
+    targetPort: 8082
+    protocol: TCP
+  type: ClusterIP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ptp-model-storage
+  namespace: ptp-ml
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ptp-ml-service
+  namespace: ptp-ml
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: ptp-ml
+  name: ptp-ml-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ptp-ml-binding
+  namespace: ptp-ml
+subjects:
+- kind: ServiceAccount
+  name: ptp-ml-service
+  namespace: ptp-ml
+roleRef:
+  kind: Role
+  name: ptp-ml-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# Training Job for ML Model
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ptp-model-trainer
+  namespace: ptp-ml
+  labels:
+    app: ptp-training
+spec:
+  template:
+    metadata:
+      labels:
+        app: ptp-training
+    spec:
+      serviceAccountName: ptp-ml-service
+      restartPolicy: OnFailure
+      containers:
+      - name: trainer
+        image: quay.io/aneeshkp/ptp-trainer:latest
+        imagePullPolicy: Always
+        env:
+        - name: PTP_TRAINING_DATA_PATH
+          value: "/app/training_data"
+        - name: MODEL_OUTPUT_PATH
+          value: "/app/models"
+        - name: TRAINING_EPOCHS
+          value: "50"
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        volumeMounts:
+        - name: model-storage
+          mountPath: /app/models
+        - name: training-data
+          mountPath: /app/training_data
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: ptp-model-storage
+      - name: training-data
+        persistentVolumeClaim:
+          claimName: ptp-training-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ptp-training-data
+  namespace: ptp-ml
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+# ConfigMap for training configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ptp-training-config
+  namespace: ptp-ml
+data:
+  config.json: |
+    {
+      "sequence_length": 40,
+      "prediction_horizon": 10,
+      "input_size": 20,
+      "tcn_channels": [32, 64, 32],
+      "dropout": 0.2,
+      "learning_rate": 0.001,
+      "batch_size": 16,
+      "num_epochs": 100,
+      "early_stopping_patience": 15,
+      "min_sequences_per_profile": 10,
+      "training_split": 0.8
+    }
