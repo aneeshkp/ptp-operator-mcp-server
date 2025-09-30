@@ -19,6 +19,15 @@ import yaml
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
+# Import ML components
+try:
+    from src.ptp_data_collector import PTPDataCollector
+    from src.ptp_inference_service import PTPInferenceService
+    ML_AVAILABLE = True
+except ImportError:
+    logger.warning("ML components not available, running without prediction capabilities")
+    ML_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -781,13 +790,33 @@ class PTPDiagnosticAgent:
         return changes
 
 class PTPAgenticService:
-    """Main agentic service combining subscription and diagnosis"""
-    
+    """Main agentic service combining subscription, diagnosis, and ML prediction"""
+
     def __init__(self, ptp_namespace: str = 'openshift-ptp', agent_namespace: str = 'ptp-agent'):
         self.subscriber = PTPEventSubscriber(ptp_namespace, agent_namespace)
         self.diagnostic_agent = PTPDiagnosticAgent()
         self.alerts: List[DiagnosticResult] = []
         self.mcp_integration_port = int(os.getenv('MCP_INTEGRATION_PORT', '8081'))
+
+        # ML components (if available)
+        self.ml_enabled = ML_AVAILABLE and os.getenv('ENABLE_ML_PREDICTIONS', 'true').lower() == 'true'
+        if self.ml_enabled:
+            self.data_collector = PTPDataCollector()
+            # Initialize inference service if model exists
+            model_path = os.getenv('PTP_MODEL_PATH', '/app/models/ptp_model.onnx')
+            if os.path.exists(model_path):
+                try:
+                    self.inference_service = PTPInferenceService(model_path)
+                    logger.info("ML prediction service initialized")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize ML service: {e}")
+                    self.ml_enabled = False
+            else:
+                logger.info("No trained model found, ML predictions disabled")
+                self.inference_service = None
+        else:
+            self.data_collector = None
+            self.inference_service = None
         
     async def analyze_event(self, event: PTPEvent):
         """Analyze event and generate alerts"""
