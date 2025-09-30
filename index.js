@@ -529,6 +529,129 @@ class PTPOperatorMCPServer {
               }
             }
           }
+        },
+        {
+          name: 'get_hardware_info',
+          description: 'Get comprehensive hardware information for PTP-capable network interfaces using ethtool',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              namespace: {
+                type: 'string',
+                description: 'PTP namespace (default: openshift-ptp)',
+                default: 'openshift-ptp'
+              },
+              podName: {
+                type: 'string',
+                description: 'Specific pod name (optional)'
+              },
+              interface: {
+                type: 'string',
+                description: 'Specific network interface (optional - shows all if not specified)'
+              },
+              includeTimestamping: {
+                type: 'boolean',
+                description: 'Include detailed timestamping capabilities',
+                default: true
+              }
+            }
+          }
+        },
+        {
+          name: 'list_ptp_interfaces',
+          description: 'List all network interfaces and their PTP capabilities, status, and configuration mapping',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              namespace: {
+                type: 'string',
+                description: 'PTP namespace (default: openshift-ptp)',
+                default: 'openshift-ptp'
+              },
+              podName: {
+                type: 'string',
+                description: 'Specific pod name (optional)'
+              },
+              activeOnly: {
+                type: 'boolean',
+                description: 'Show only active/up interfaces',
+                default: false
+              },
+              ptpCapableOnly: {
+                type: 'boolean',
+                description: 'Show only PTP-capable interfaces',
+                default: false
+              }
+            }
+          }
+        },
+        {
+          name: 'map_ptp_hardware',
+          description: 'Map PTP configurations to actual hardware interfaces and show hardware capabilities',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              namespace: {
+                type: 'string',
+                description: 'PTP namespace (default: openshift-ptp)',
+                default: 'openshift-ptp'
+              },
+              configName: {
+                type: 'string',
+                description: 'Specific PtpConfig name (optional)'
+              },
+              includeHardwareDetails: {
+                type: 'boolean',
+                description: 'Include detailed hardware capabilities',
+                default: true
+              }
+            }
+          }
+        },
+        {
+          name: 'check_interface_ptp_support',
+          description: 'Check specific interface for PTP hardware support and timestamping capabilities',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              namespace: {
+                type: 'string',
+                description: 'PTP namespace (default: openshift-ptp)',
+                default: 'openshift-ptp'
+              },
+              podName: {
+                type: 'string',
+                description: 'Specific pod name (optional)'
+              },
+              interface: {
+                type: 'string',
+                description: 'Network interface name (e.g., ens1f0, eth0)',
+                required: true
+              }
+            }
+          }
+        },
+        {
+          name: 'get_nic_details',
+          description: 'Get detailed NIC information including driver, firmware, and PTP-specific features',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              namespace: {
+                type: 'string',
+                description: 'PTP namespace (default: openshift-ptp)',
+                default: 'openshift-ptp'
+              },
+              podName: {
+                type: 'string',
+                description: 'Specific pod name (optional)'
+              },
+              interface: {
+                type: 'string',
+                description: 'Specific network interface (optional - shows all if not specified)'
+              }
+            }
+          }
         }
       ]
     }));
@@ -645,6 +768,16 @@ class PTPOperatorMCPServer {
             return await this.forceAlertCheck(args);
           case 'get_alert_notifications':
             return await this.getAlertNotifications(args);
+          case 'get_hardware_info':
+            return await this.getHardwareInfo(args);
+          case 'list_ptp_interfaces':
+            return await this.listPTPInterfaces(args);
+          case 'map_ptp_hardware':
+            return await this.mapPTPHardware(args);
+          case 'check_interface_ptp_support':
+            return await this.checkInterfacePTPSupport(args);
+          case 'get_nic_details':
+            return await this.getNICDetails(args);
           default:
             throw new McpError(ErrorCode.MethodNotFound, `Tool ${name} not found`);
         }
@@ -1421,6 +1554,1012 @@ class PTPOperatorMCPServer {
       time: ev?.time,
       values: flatValues
     };
+  }
+
+  // Hardware detection and interface mapping methods
+  async getHardwareInfo(args) {
+    const {
+      namespace = this.ptpNamespace,
+      podName,
+      interface: interfaceName,
+      includeTimestamping = true
+    } = args;
+
+    try {
+      const targetPodName = podName || await this.getFirstPTPPod(namespace);
+      const result = {
+        pod: targetPodName,
+        node: await this.getPodNodeName(namespace, targetPodName),
+        interfaces: {},
+        timestamp: new Date().toISOString()
+      };
+
+      // Get list of interfaces first
+      let interfaces = [];
+      if (interfaceName) {
+        interfaces = [interfaceName];
+      } else {
+        const interfaceList = await this.execCommandInPod(
+          namespace, targetPodName, this.ptpContainers.daemon,
+          ['ls', '/sys/class/net']
+        );
+        interfaces = interfaceList.trim().split('\n').filter(iface =>
+          iface && !iface.match(/^(lo|docker|veth|br-|virbr)/)
+        );
+      }
+
+      // Limit interfaces to avoid timeouts - focus on real hardware
+      const realInterfaces = interfaces.filter(iface =>
+        iface.match(/^(ens|eno|eth|enp)/) || interfaceName === iface
+      ).slice(0, 20); // Limit to first 20 real interfaces
+
+      // Get lightweight hardware info for each interface
+      for (const iface of realInterfaces) {
+        try {
+          const hardwareInfo = await this.getLightweightHardwareInfo(
+            namespace, targetPodName, iface, includeTimestamping
+          );
+          result.interfaces[iface] = hardwareInfo;
+        } catch (error) {
+          result.interfaces[iface] = {
+            name: iface,
+            error: error.message,
+            ptpCapable: false
+          };
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Hardware Information from pod ${targetPodName} (showing ${realInterfaces.length} physical interfaces):\n\n${JSON.stringify(result, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Failed to get hardware info: ${error.message}`);
+    }
+  }
+
+  async listPTPInterfaces(args) {
+    const {
+      namespace = this.ptpNamespace,
+      podName,
+      activeOnly = false,
+      ptpCapableOnly = false
+    } = args;
+
+    try {
+      const targetPodName = podName || await this.getFirstPTPPod(namespace);
+      const result = {
+        pod: targetPodName,
+        node: await this.getPodNodeName(namespace, targetPodName),
+        summary: {},
+        interfaces: [],
+        timestamp: new Date().toISOString()
+      };
+
+      // Get all network interfaces quickly
+      const interfaceList = await this.execCommandInPod(
+        namespace, targetPodName, this.ptpContainers.daemon,
+        ['ls', '/sys/class/net']
+      );
+
+      const allInterfaces = interfaceList.trim().split('\n').filter(iface =>
+        iface && !iface.match(/^(lo|docker|veth|br-|virbr)/)
+      );
+
+      // Get bulk interface status efficiently
+      const interfacesStatus = await this.getBulkInterfaceStatus(namespace, targetPodName, allInterfaces);
+
+      let interfaceCount = 0;
+      let ptpCapableCount = 0;
+      let activeCount = 0;
+
+      for (const interfaceInfo of interfacesStatus) {
+        try {
+          // Apply filters
+          if (activeOnly && !interfaceInfo.isUp) continue;
+          if (ptpCapableOnly && !interfaceInfo.ptpCapable) continue;
+
+          result.interfaces.push(interfaceInfo);
+          interfaceCount++;
+          if (interfaceInfo.ptpCapable) ptpCapableCount++;
+          if (interfaceInfo.isUp) activeCount++;
+
+        } catch (error) {
+          result.interfaces.push({
+            name: interfaceInfo.name,
+            error: error.message
+          });
+        }
+      }
+
+      result.summary = {
+        totalInterfaces: interfaceCount,
+        ptpCapableInterfaces: ptpCapableCount,
+        activeInterfaces: activeCount,
+        filters: { activeOnly, ptpCapableOnly }
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `PTP Interfaces from pod ${targetPodName}:\n\n${JSON.stringify(result, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Failed to list PTP interfaces: ${error.message}`);
+    }
+  }
+
+  async mapPTPHardware(args) {
+    const {
+      namespace = this.ptpNamespace,
+      configName,
+      includeHardwareDetails = true
+    } = args;
+
+    try {
+      // Get PTP configurations
+      const ptpConfigs = await this.getPtpConfigs({ namespace, configName });
+      const configData = JSON.parse(ptpConfigs.content[0].text.split(':\n\n')[1]);
+
+      // Get NodePtpDevice information
+      const nodePtpDevices = await this.getNodePtpConfigs({});
+      const deviceData = JSON.parse(nodePtpDevices.content[0].text.split(':\n\n')[1]);
+
+      const result = {
+        namespace,
+        configurationMapping: [],
+        hardwareInventory: {},
+        summary: {},
+        timestamp: new Date().toISOString()
+      };
+
+      // Process each PTP configuration
+      const configs = Array.isArray(configData) ? configData : [configData];
+
+      for (const config of configs) {
+        const mapping = {
+          configName: config.name,
+          spec: config.spec,
+          mappedInterfaces: [],
+          nodeSelectors: config.spec?.nodeSelector || {},
+          profiles: config.spec?.profile || []
+        };
+
+        // Map profiles to actual hardware
+        for (const profile of mapping.profiles) {
+          const interfaceNames = profile.interface || [];
+
+          for (const interfaceName of interfaceNames) {
+            // Find matching hardware from NodePtpDevice
+            const matchingDevices = deviceData.filter(device =>
+              device.devices?.some(dev => dev.name === interfaceName)
+            );
+
+            for (const device of matchingDevices) {
+              const matchingDev = device.devices.find(dev => dev.name === interfaceName);
+
+              const interfaceMapping = {
+                interface: interfaceName,
+                nodeName: device.nodeName,
+                profile: profile.name,
+                hardware: matchingDev,
+                ptpSettings: {
+                  ptp4lOpts: profile.ptp4lOpts,
+                  phc2sysOpts: profile.phc2sysOpts,
+                  ptp4lConf: profile.ptp4lConf
+                }
+              };
+
+              // Add detailed hardware info if requested
+              if (includeHardwareDetails) {
+                try {
+                  // Try to get a pod on this node for hardware details
+                  const podOnNode = await this.findPodOnNode(namespace, device.nodeName);
+                  if (podOnNode) {
+                    const hardwareDetails = await this.getInterfaceHardwareDetails(
+                      namespace, podOnNode, interfaceName, true
+                    );
+                    interfaceMapping.hardwareDetails = hardwareDetails;
+                  }
+                } catch (e) {
+                  interfaceMapping.hardwareDetails = { error: e.message };
+                }
+              }
+
+              mapping.mappedInterfaces.push(interfaceMapping);
+            }
+          }
+        }
+
+        result.configurationMapping.push(mapping);
+      }
+
+      // Build hardware inventory summary
+      result.summary = {
+        totalConfigurations: result.configurationMapping.length,
+        totalMappedInterfaces: result.configurationMapping.reduce(
+          (sum, config) => sum + config.mappedInterfaces.length, 0
+        ),
+        nodesWithPTP: Array.from(new Set(
+          result.configurationMapping.flatMap(config =>
+            config.mappedInterfaces.map(iface => iface.nodeName)
+          )
+        )).length
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `PTP Hardware Mapping for namespace ${namespace}:\n\n${JSON.stringify(result, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Failed to map PTP hardware: ${error.message}`);
+    }
+  }
+
+  async checkInterfacePTPSupport(args) {
+    const {
+      namespace = this.ptpNamespace,
+      podName,
+      interface: interfaceName
+    } = args;
+
+    if (!interfaceName) {
+      throw new McpError(ErrorCode.InvalidParams, 'Interface parameter is required');
+    }
+
+    try {
+      const targetPodName = podName || await this.getFirstPTPPod(namespace);
+
+      const result = {
+        pod: targetPodName,
+        interface: interfaceName,
+        node: await this.getPodNodeName(namespace, targetPodName),
+        ptpSupport: {},
+        recommendations: [],
+        timestamp: new Date().toISOString()
+      };
+
+      // Check if interface exists
+      const interfaceExists = await this.execCommandInPod(
+        namespace, targetPodName, this.ptpContainers.daemon,
+        ['test', '-d', `/sys/class/net/${interfaceName}`]
+      ).then(() => true).catch(() => false);
+
+      if (!interfaceExists) {
+        result.ptpSupport = {
+          supported: false,
+          reason: 'Interface does not exist'
+        };
+        result.recommendations.push(`Interface ${interfaceName} not found on node`);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `PTP Support Check for ${interfaceName} on pod ${targetPodName}:\n\n${JSON.stringify(result, null, 2)}`,
+            },
+          ],
+        };
+      }
+
+      // Get comprehensive PTP support information
+      const supportInfo = await this.getInterfacePTPCapabilities(namespace, targetPodName, interfaceName);
+      result.ptpSupport = supportInfo;
+
+      // Generate recommendations
+      if (supportInfo.supported) {
+        result.recommendations.push('Interface supports PTP - ready for configuration');
+        if (supportInfo.timestamping?.hardware) {
+          result.recommendations.push('Hardware timestamping supported - optimal for precision');
+        } else if (supportInfo.timestamping?.software) {
+          result.recommendations.push('Only software timestamping - may have reduced precision');
+        }
+        if (supportInfo.phc?.available) {
+          result.recommendations.push('PHC (PTP Hardware Clock) available');
+        }
+      } else {
+        result.recommendations.push('Interface does not support PTP');
+        result.recommendations.push('Consider using a different interface or network card');
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `PTP Support Check for ${interfaceName} on pod ${targetPodName}:\n\n${JSON.stringify(result, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Failed to check interface PTP support: ${error.message}`);
+    }
+  }
+
+  async getNICDetails(args) {
+    const {
+      namespace = this.ptpNamespace,
+      podName,
+      interface: interfaceName
+    } = args;
+
+    try {
+      const targetPodName = podName || await this.getFirstPTPPod(namespace);
+      const result = {
+        pod: targetPodName,
+        node: await this.getPodNodeName(namespace, targetPodName),
+        nics: {},
+        timestamp: new Date().toISOString()
+      };
+
+      // Get list of interfaces
+      let interfaces = [];
+      if (interfaceName) {
+        interfaces = [interfaceName];
+      } else {
+        const interfaceList = await this.execCommandInPod(
+          namespace, targetPodName, this.ptpContainers.daemon,
+          ['ls', '/sys/class/net']
+        );
+        interfaces = interfaceList.trim().split('\n').filter(iface =>
+          iface && !iface.match(/^(lo|docker|veth|br-|virbr)/)
+        );
+      }
+
+      // Get detailed NIC information
+      for (const iface of interfaces) {
+        try {
+          const nicDetails = await this.getNICDetailedInfo(namespace, targetPodName, iface);
+          result.nics[iface] = nicDetails;
+        } catch (error) {
+          result.nics[iface] = { error: error.message };
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `NIC Details from pod ${targetPodName}:\n\n${JSON.stringify(result, null, 2)}`,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new McpError(ErrorCode.InternalError, `Failed to get NIC details: ${error.message}`);
+    }
+  }
+
+  // Optimized bulk interface status method
+  async getBulkInterfaceStatus(namespace, podName, interfaces) {
+    const results = [];
+
+    try {
+      // Get all interface states in one command
+      const ipLinkOutput = await this.execCommandInPod(
+        namespace, podName, this.ptpContainers.daemon,
+        ['ip', 'link', 'show']
+      );
+
+      const interfaceStates = this.parseBulkIpLinkOutput(ipLinkOutput);
+
+      // Process each interface quickly
+      for (const iface of interfaces) {
+        const status = {
+          name: iface,
+          isUp: false,
+          hasIP: false,
+          speed: null,
+          duplex: null,
+          ptpCapable: false,
+          ptpClockId: null,
+          hasHardwareTimestamping: false,
+          mtu: null,
+          mac: null
+        };
+
+        try {
+          // Get basic info from bulk ip link output
+          const linkInfo = interfaceStates[iface];
+          if (linkInfo) {
+            status.isUp = linkInfo.isUp;
+            status.mtu = linkInfo.mtu;
+            status.mac = linkInfo.mac;
+          }
+
+          // Quick PTP capability check with detailed hardware info
+          const ptpInfo = await this.quickPTPCheck(namespace, podName, iface);
+          status.ptpCapable = ptpInfo.supported;
+          status.ptpClockId = ptpInfo.ptpClockId;
+          status.hasHardwareTimestamping = ptpInfo.hasHardwareTimestamping;
+          if (ptpInfo.error) {
+            status.ptpError = ptpInfo.error;
+          }
+
+          results.push(status);
+        } catch (error) {
+          results.push({
+            name: iface,
+            error: error.message,
+            isUp: false,
+            ptpCapable: false
+          });
+        }
+      }
+
+      return results;
+    } catch (error) {
+      // Fallback to individual interface checks if bulk fails
+      return await this.fallbackInterfaceStatus(namespace, podName, interfaces);
+    }
+  }
+
+  parseBulkIpLinkOutput(output) {
+    const interfaces = {};
+    const lines = output.split('\n');
+    let currentInterface = null;
+
+    for (const line of lines) {
+      // Match interface lines like "2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500..."
+      const interfaceMatch = line.match(/^\d+:\s+([^:]+):\s+<([^>]*)>.*mtu\s+(\d+)/);
+      if (interfaceMatch) {
+        const [, name, flags, mtu] = interfaceMatch;
+        currentInterface = name.trim();
+        interfaces[currentInterface] = {
+          name: currentInterface,
+          isUp: flags.includes('UP') && !flags.includes('NO-CARRIER'),
+          mtu: parseInt(mtu),
+          mac: null
+        };
+      }
+
+      // Match MAC address lines
+      if (currentInterface && line.includes('link/ether')) {
+        const macMatch = line.match(/link\/ether\s+([a-f0-9:]+)/);
+        if (macMatch && interfaces[currentInterface]) {
+          interfaces[currentInterface].mac = macMatch[1];
+        }
+      }
+    }
+
+    return interfaces;
+  }
+
+  async quickPTPCheck(namespace, podName, interfaceName) {
+    try {
+      // Check for PTP Hardware Clock ID in ethtool -T output
+      const ethtoolOutput = await this.execCommandInPod(
+        namespace, podName, this.ptpContainers.daemon,
+        ['timeout', '3', 'ethtool', '-T', interfaceName]
+      );
+
+      // Look for "PTP Hardware Clock: X" in the output
+      const ptpClockMatch = ethtoolOutput.match(/PTP Hardware Clock:\s*(\d+)/);
+      if (ptpClockMatch) {
+        return {
+          supported: true,
+          ptpClockId: parseInt(ptpClockMatch[1]),
+          hasHardwareTimestamping: ethtoolOutput.includes('hardware-transmit') &&
+                                   ethtoolOutput.includes('hardware-receive')
+        };
+      }
+
+      // Also check for hardware timestamping capabilities even without explicit PTP clock
+      const hasHardwareTimestamping = ethtoolOutput.includes('hardware-transmit') &&
+                                      ethtoolOutput.includes('hardware-receive');
+
+      return {
+        supported: hasHardwareTimestamping,
+        ptpClockId: null,
+        hasHardwareTimestamping: hasHardwareTimestamping
+      };
+
+    } catch (error) {
+      // If ethtool -T fails or times out, likely not PTP capable
+      return {
+        supported: false,
+        ptpClockId: null,
+        hasHardwareTimestamping: false,
+        error: error.message
+      };
+    }
+  }
+
+  async fallbackInterfaceStatus(namespace, podName, interfaces) {
+    const results = [];
+
+    // Simplified fallback - just basic info without PTP check
+    for (const iface of interfaces) {
+      try {
+        const linkInfo = await this.execCommandInPod(
+          namespace, podName, this.ptpContainers.daemon,
+          ['ip', 'link', 'show', iface]
+        );
+
+        const status = {
+          name: iface,
+          isUp: linkInfo.includes('state UP'),
+          mtu: this.extractMTU(linkInfo),
+          ptpCapable: false, // Skip PTP check in fallback for speed
+          hasIP: false,
+          speed: null,
+          duplex: null,
+          mac: null
+        };
+
+        const macMatch = linkInfo.match(/link\/ether\s+([a-f0-9:]+)/);
+        if (macMatch) status.mac = macMatch[1];
+
+        results.push(status);
+      } catch (error) {
+        results.push({
+          name: iface,
+          error: error.message,
+          isUp: false,
+          ptpCapable: false
+        });
+      }
+    }
+
+    return results;
+  }
+
+  // Lightweight hardware info method for better performance
+  async getLightweightHardwareInfo(namespace, podName, interfaceName, includeTimestamping) {
+    const info = {
+      name: interfaceName,
+      driver: null,
+      ptpCapable: false,
+      ptpClockId: null,
+      hasHardwareTimestamping: false,
+      link: {
+        isUp: false,
+        speed: null,
+        mtu: null,
+        mac: null
+      }
+    };
+
+    try {
+      // Get basic link info quickly
+      const linkInfo = await this.execCommandInPod(
+        namespace, podName, this.ptpContainers.daemon,
+        ['ip', 'link', 'show', interfaceName]
+      );
+
+      info.link = this.parseIpLinkOutput(linkInfo);
+      info.link.isUp = linkInfo.includes('state UP');
+
+      // Get driver info efficiently
+      try {
+        const driverInfo = await this.execCommandInPod(
+          namespace, podName, this.ptpContainers.daemon,
+          ['timeout', '3', 'ethtool', '-i', interfaceName]
+        );
+        const parsedDriver = this.parseEthtoolDriverInfo(driverInfo);
+        info.driver = parsedDriver.driver || null;
+        info.version = parsedDriver.version || null;
+        info.busInfo = parsedDriver.bus_info || null;
+      } catch (e) {
+        // Skip driver info if not available
+      }
+
+      // PTP capability check (only if requested)
+      if (includeTimestamping) {
+        const ptpInfo = await this.quickPTPCheck(namespace, podName, interfaceName);
+        info.ptpCapable = ptpInfo.supported;
+        info.ptpClockId = ptpInfo.ptpClockId;
+        info.hasHardwareTimestamping = ptpInfo.hasHardwareTimestamping;
+      }
+
+      return info;
+    } catch (error) {
+      return {
+        name: interfaceName,
+        error: error.message,
+        ptpCapable: false
+      };
+    }
+  }
+
+  // Helper methods for hardware detection
+  async getInterfaceHardwareDetails(namespace, podName, interfaceName, includeTimestamping) {
+    const details = {
+      name: interfaceName,
+      basic: {},
+      ethtool: {},
+      ptp: {},
+      timestamping: {},
+      status: {}
+    };
+
+    try {
+      // Basic interface information
+      const basicInfo = await this.execCommandInPod(
+        namespace, podName, this.ptpContainers.daemon,
+        ['ip', 'link', 'show', interfaceName]
+      );
+      details.basic = this.parseIpLinkOutput(basicInfo);
+
+      // Ethtool information
+      try {
+        const ethtoolInfo = await this.execCommandInPod(
+          namespace, podName, this.ptpContainers.daemon,
+          ['ethtool', interfaceName]
+        );
+        details.ethtool = this.parseEthtoolOutput(ethtoolInfo);
+      } catch (e) {
+        details.ethtool = { error: 'ethtool info unavailable' };
+      }
+
+      // Driver information
+      try {
+        const driverInfo = await this.execCommandInPod(
+          namespace, podName, this.ptpContainers.daemon,
+          ['ethtool', '-i', interfaceName]
+        );
+        details.ethtool.driver = this.parseEthtoolDriverInfo(driverInfo);
+      } catch (e) {
+        details.ethtool.driver = { error: 'driver info unavailable' };
+      }
+
+      // PTP capabilities
+      if (includeTimestamping) {
+        details.timestamping = await this.getInterfacePTPCapabilities(namespace, podName, interfaceName);
+      }
+
+      // Interface status
+      details.status = await this.getInterfaceStatus(namespace, podName, interfaceName);
+
+    } catch (error) {
+      details.error = error.message;
+    }
+
+    return details;
+  }
+
+  async getInterfacePTPCapabilities(namespace, podName, interfaceName) {
+    const capabilities = {
+      supported: false,
+      timestamping: {
+        hardware: false,
+        software: false,
+        filters: []
+      },
+      phc: {
+        available: false,
+        device: null
+      },
+      details: {}
+    };
+
+    try {
+      // Check timestamping capabilities
+      const timestampInfo = await this.execCommandInPod(
+        namespace, podName, this.ptpContainers.daemon,
+        ['ethtool', '-T', interfaceName]
+      );
+
+      const timestampData = this.parseTimestampCapabilities(timestampInfo);
+      capabilities.timestamping = timestampData.timestamping;
+      capabilities.supported = timestampData.supported;
+      capabilities.details.timestampOutput = timestampInfo;
+
+      // Check for PHC device
+      try {
+        const phcCheck = await this.execCommandInPod(
+          namespace, podName, this.ptpContainers.daemon,
+          ['find', '/dev', '-name', `ptp*`, '-exec', 'ls', '-l', '{}', ';']
+        );
+
+        if (phcCheck.trim()) {
+          capabilities.phc.available = true;
+          capabilities.phc.device = phcCheck.trim();
+        }
+      } catch (e) {
+        // No PHC device found
+      }
+
+    } catch (error) {
+      capabilities.details.error = error.message;
+    }
+
+    return capabilities;
+  }
+
+  async getInterfaceStatus(namespace, podName, interfaceName) {
+    const status = {
+      name: interfaceName,
+      isUp: false,
+      hasIP: false,
+      speed: null,
+      duplex: null,
+      ptpCapable: false,
+      mtu: null
+    };
+
+    try {
+      // Get link status
+      const linkInfo = await this.execCommandInPod(
+        namespace, podName, this.ptpContainers.daemon,
+        ['ip', 'link', 'show', interfaceName]
+      );
+
+      status.isUp = linkInfo.includes('state UP');
+      status.mtu = this.extractMTU(linkInfo);
+
+      // Get IP information
+      try {
+        const ipInfo = await this.execCommandInPod(
+          namespace, podName, this.ptpContainers.daemon,
+          ['ip', 'addr', 'show', interfaceName]
+        );
+        status.hasIP = ipInfo.includes('inet ');
+      } catch (e) {
+        // No IP info
+      }
+
+      // Get ethtool status
+      try {
+        const ethtoolStatus = await this.execCommandInPod(
+          namespace, podName, this.ptpContainers.daemon,
+          ['ethtool', interfaceName]
+        );
+
+        const speedMatch = ethtoolStatus.match(/Speed:\s*(\d+\w+)/);
+        if (speedMatch) status.speed = speedMatch[1];
+
+        const duplexMatch = ethtoolStatus.match(/Duplex:\s*(\w+)/);
+        if (duplexMatch) status.duplex = duplexMatch[1];
+      } catch (e) {
+        // Ethtool info not available
+      }
+
+      // Check PTP capability (basic check)
+      try {
+        const timestampInfo = await this.execCommandInPod(
+          namespace, podName, this.ptpContainers.daemon,
+          ['ethtool', '-T', interfaceName]
+        );
+        status.ptpCapable = timestampInfo.includes('hardware-transmit') ||
+                           timestampInfo.includes('hardware-receive');
+      } catch (e) {
+        status.ptpCapable = false;
+      }
+
+    } catch (error) {
+      status.error = error.message;
+    }
+
+    return status;
+  }
+
+  async getNICDetailedInfo(namespace, podName, interfaceName) {
+    const details = {
+      interface: interfaceName,
+      driver: {},
+      hardware: {},
+      features: {},
+      statistics: {},
+      pci: {}
+    };
+
+    try {
+      // Driver information
+      const driverInfo = await this.execCommandInPod(
+        namespace, podName, this.ptpContainers.daemon,
+        ['ethtool', '-i', interfaceName]
+      );
+      details.driver = this.parseEthtoolDriverInfo(driverInfo);
+
+      // Hardware features
+      try {
+        const features = await this.execCommandInPod(
+          namespace, podName, this.ptpContainers.daemon,
+          ['ethtool', '-k', interfaceName]
+        );
+        details.features = this.parseEthtoolFeatures(features);
+      } catch (e) {
+        details.features = { error: 'features unavailable' };
+      }
+
+      // Statistics
+      try {
+        const stats = await this.execCommandInPod(
+          namespace, podName, this.ptpContainers.daemon,
+          ['ethtool', '-S', interfaceName]
+        );
+        details.statistics = this.parseEthtoolStatistics(stats);
+      } catch (e) {
+        details.statistics = { error: 'statistics unavailable' };
+      }
+
+      // PCI information (if available)
+      if (details.driver.busInfo) {
+        try {
+          const pciInfo = await this.execCommandInPod(
+            namespace, podName, this.ptpContainers.daemon,
+            ['lspci', '-s', details.driver.busInfo, '-v']
+          );
+          details.pci = this.parseLspciOutput(pciInfo);
+        } catch (e) {
+          details.pci = { error: 'PCI info unavailable' };
+        }
+      }
+
+    } catch (error) {
+      details.error = error.message;
+    }
+
+    return details;
+  }
+
+  // Parsing helper methods
+  parseIpLinkOutput(output) {
+    const info = { mac: null, mtu: null, state: null };
+
+    const macMatch = output.match(/link\/ether\s+([a-f0-9:]+)/);
+    if (macMatch) info.mac = macMatch[1];
+
+    const mtuMatch = output.match(/mtu\s+(\d+)/);
+    if (mtuMatch) info.mtu = parseInt(mtuMatch[1]);
+
+    if (output.includes('state UP')) info.state = 'UP';
+    else if (output.includes('state DOWN')) info.state = 'DOWN';
+
+    return info;
+  }
+
+  parseEthtoolOutput(output) {
+    const info = {};
+    const lines = output.split('\n');
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.includes(':')) {
+        const [key, value] = trimmed.split(':').map(s => s.trim());
+        info[key.toLowerCase().replace(/\s+/g, '_')] = value;
+      }
+    }
+
+    return info;
+  }
+
+  parseEthtoolDriverInfo(output) {
+    const info = {};
+    const lines = output.split('\n');
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.includes(':')) {
+        const [key, value] = trimmed.split(':').map(s => s.trim());
+        info[key.toLowerCase().replace(/\s+/g, '_').replace(/-/g, '_')] = value;
+      }
+    }
+
+    return info;
+  }
+
+  parseTimestampCapabilities(output) {
+    const result = {
+      supported: false,
+      timestamping: {
+        hardware: false,
+        software: false,
+        filters: []
+      },
+      ptpClockId: null
+    };
+
+    // Check for PTP Hardware Clock ID
+    const ptpClockMatch = output.match(/PTP Hardware Clock:\s*(\d+)/);
+    if (ptpClockMatch) {
+      result.ptpClockId = parseInt(ptpClockMatch[1]);
+      result.supported = true;
+    }
+
+    if (output.includes('hardware-transmit') || output.includes('hardware-receive')) {
+      result.supported = true;
+      result.timestamping.hardware = true;
+    }
+
+    if (output.includes('software-transmit') || output.includes('software-receive')) {
+      result.timestamping.software = true;
+      if (!result.supported) result.supported = true;
+    }
+
+    // Extract filter capabilities
+    const lines = output.split('\n');
+    const filterLines = lines.filter(line =>
+      line.includes('filter') || line.includes('PTP') || line.includes('ptpv')
+    );
+    result.timestamping.filters = filterLines.map(line => line.trim());
+
+    return result;
+  }
+
+  parseEthtoolFeatures(output) {
+    const features = {};
+    const lines = output.split('\n');
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.includes(':')) {
+        const [feature, status] = trimmed.split(':').map(s => s.trim());
+        features[feature.replace(/\s+/g, '_')] = status;
+      }
+    }
+
+    return features;
+  }
+
+  parseEthtoolStatistics(output) {
+    const stats = {};
+    const lines = output.split('\n');
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.includes(':')) {
+        const [stat, value] = trimmed.split(':').map(s => s.trim());
+        const numValue = parseInt(value);
+        stats[stat.replace(/\s+/g, '_')] = isNaN(numValue) ? value : numValue;
+      }
+    }
+
+    return stats;
+  }
+
+  parseLspciOutput(output) {
+    const info = { vendor: null, device: null, subsystem: null };
+    const lines = output.split('\n');
+
+    for (const line of lines) {
+      if (line.includes('Vendor:')) {
+        info.vendor = line.split('Vendor:')[1]?.trim();
+      } else if (line.includes('Device:')) {
+        info.device = line.split('Device:')[1]?.trim();
+      } else if (line.includes('Subsystem:')) {
+        info.subsystem = line.split('Subsystem:')[1]?.trim();
+      }
+    }
+
+    return info;
+  }
+
+  extractMTU(linkOutput) {
+    const mtuMatch = linkOutput.match(/mtu\s+(\d+)/);
+    return mtuMatch ? parseInt(mtuMatch[1]) : null;
+  }
+
+  async getPodNodeName(namespace, podName) {
+    try {
+      const pod = await this.k8sApi.readNamespacedPod(podName, namespace);
+      return pod.body.spec?.nodeName || 'unknown';
+    } catch (error) {
+      return 'unknown';
+    }
+  }
+
+  async findPodOnNode(namespace, nodeName) {
+    try {
+      const response = await this.k8sApi.listNamespacedPod(
+        namespace, undefined, undefined, `spec.nodeName=${nodeName}`, undefined, 'app=linuxptp-daemon'
+      );
+
+      const pods = response.body.items || [];
+      return pods.length > 0 ? pods[0].metadata.name : null;
+    } catch (error) {
+      return null;
+    }
   }
 
   // Agentic service integration methods
