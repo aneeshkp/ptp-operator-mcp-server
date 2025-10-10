@@ -625,10 +625,10 @@ class PTPOperatorMCPServer {
               },
               interface: {
                 type: 'string',
-                description: 'Network interface name (e.g., ens1f0, eth0)',
-                required: true
+                description: 'Network interface name (e.g., ens1f0, eth0)'
               }
-            }
+            },
+            required: ['interface']
           }
         },
         {
