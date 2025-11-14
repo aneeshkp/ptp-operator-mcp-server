@@ -1,0 +1,42 @@
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install ML-specific dependencies
+RUN pip install --no-cache-dir \
+    torch==2.0.1+cpu \
+    onnxruntime==1.15.1 \
+    numpy>=1.21.0 \
+    scikit-learn>=1.0.0 \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# Copy source code
+COPY src/ ./src/
+
+# Create models directory
+RUN mkdir -p /app/models
+
+# Create non-root user
+RUN useradd -r -u 1001 -g root ptpml
+RUN chown -R ptpml:root /app
+USER ptpml
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:8082/health')" || exit 1
+
+EXPOSE 8082
+
+CMD ["python", "src/ptp_inference_service.py"]
